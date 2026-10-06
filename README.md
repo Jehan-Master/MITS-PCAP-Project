@@ -30,23 +30,69 @@ Before running the program, ensure you have:
 
 ### Installing
 
-[//]: # (* How/where to download your program)
-[//]: # (* Any modifications needed to be made to files/folders)
+The recommended way to run the prototype is with Docker. With Docker, Python and pip do **not** need to be installed on your own machine — every part runs in a container with its own Python 3.14 and pinned packages.
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+2. Clone the repository:
+3. Start Docker Desktop before running any of the commands below.
+
+The project uses these folders in the repository root for data. They are created automatically on first use, mounted into the containers, and ignored by git, so large datasets and the database never end up in an image or a commit:
+
+| Folder | Contents | Used by |
+|---|---|---|
+| `input/` | Suricata `eve.json` files | ingestion |
+| `database/` | the shared SQLite database `mits.db` | all parts |
+| `pcap/` | `.pcap` / `.pcapng` files | PCAP evidence |
+| `evidence/` | optional per-case PCAPNG exports | PCAP evidence |
 
 ### Executing program
 
-[//]: # (* How to run the program)
-[//]: # (* Step-by-step bullets)
-[//]: # (```)
-[//]: # (code blocks for commands)
-[//]: # (```)
+All commands are run from the repository root.
+
+**1. Ingest EVE-JSON data into the database**
+
+Copy one or more `eve.json` files into `input/`, then run:
+```
+docker compose run --rm ingest /input/eve.json
+```
+Several files can be passed at once (`/input/day1.json /input/day2.json`). The database is written to `database/mits.db`. Running the same file again does not create duplicate rows.
+
+**2. Start the dashboard**
+```
+docker compose up --build
+```
+Open http://localhost:8501 in a browser. Stop it with:
+```
+docker compose down
+```
+
+**3. Extract PCAP evidence**
+
+Copy capture files into `pcap/`, then run:
+```
+docker compose run --rm pcap-evidence
+```
+
+**After changing code or `requirements.txt`**, rebuild the images so the change is included:
+```
+docker compose --profile tools build
+```
+Once the PCAP evidence code is merged, use `docker compose --profile tools --profile pcap build` to rebuild that image as well.
 
 ## Help
 
-[//]: # (Any advise for common problems or issues.)
-[//]: # (```)
-[//]: # (command to run if program contains helper info)
-[//]: # (```)
+* **`failed to connect to the docker API` / `cannot find the file specified`** – Docker Desktop is not running. Start it and wait until it reports that the engine is running.
+* **Port 8501 is already in use** – another Streamlit instance is running. Stop it, or change the left-hand port in `docker-compose.yml` (e.g. `"8502:8501"`) and open http://localhost:8502.
+* **`ModuleNotFoundError` inside a container** – a package is imported in the code but missing from that part's `requirements.txt`. Add it (with a pinned version) and rebuild.
+* **Code changes do not show up** – the image still contains the old code. Rebuild with `docker compose up --build`.
+* **`input file not found: /input/...`** – the file is not in the `input/` folder, or the path after `ingest` does not start with `/input/`.
+* **Database location in code** – inside Docker the database is at `/data/mits.db`, and the dashboard receives this path in the `MITS_DB_PATH` environment variable. Code that opens the database should read that variable instead of using a fixed path.
+
+Show the options of each command-line tool:
+```
+docker compose run --rm ingest --help
+docker compose run --rm pcap-evidence --help
+```
 
 ## Authors
 
