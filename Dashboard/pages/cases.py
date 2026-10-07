@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 
-from data.fake_cases import FAKE_CASES
+from data.analysis_data import get_cases
 
 
 # --------------------------------------------------
@@ -18,15 +18,19 @@ st.write(
 # Case table data
 # --------------------------------------------------
 
+cases = get_cases()
+
 case_table = pd.DataFrame([
     {
-        "ID": case["id"],
-        "Type": case["type"],
-        "Source IP": case["source_ip"],
-        "Priority": case["priority"],
-        "Status": case["status"]
+        "ID": case["case_id"],
+        "Type": "Pending",
+        "Source IP": ", ".join(case["source_ips"])
+        if case["source_ips"]
+        else "N/A",
+        "Priority": "Pending",
+        "Status": "Pending"
     }
-    for case in FAKE_CASES
+    for _, case in cases.iterrows()
 ])
 
 
@@ -41,19 +45,19 @@ col1, col2, col3 = st.columns(3)
 with col1:
     priority_filter = st.selectbox(
         "Priority",
-        ["All", "High", "Medium", "Low"]
+        ["All", "Pending"]
     )
 
 with col2:
     status_filter = st.selectbox(
         "Status",
-        ["All", "Open", "Reviewing", "Closed"]
+        ["All", "Pending"]
     )
 
 with col3:
     type_filter = st.selectbox(
         "Type",
-        ["All"] + sorted(case_table["Type"].unique().tolist())
+        ["All", "Pending"]
     )
 
 
@@ -126,6 +130,7 @@ else:
         col4.write(case["Priority"])
         col5.write(case["Status"])
 
+
 # --------------------------------------------------
 # Footer
 # --------------------------------------------------
@@ -133,5 +138,6 @@ else:
 st.divider()
 
 st.caption(
-    "Prototype dashboard — metrics and case data currently use example values."
+    "Candidate cases are generated from automated detection and correlation. "
+    "They require analyst validation and are not automatically confirmed attacks."
 )

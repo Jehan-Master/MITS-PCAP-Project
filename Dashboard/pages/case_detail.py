@@ -1,7 +1,9 @@
+import json
+
 import streamlit as st
 import pandas as pd
 
-from data.fake_cases import FAKE_CASES
+from data.analysis_data import get_case, get_case_findings
 
 
 # --------------------------------------------------
@@ -19,22 +21,18 @@ if not selected_case_id:
     st.stop()
 
 
-selected_case = next(
-    (
-        case
-        for case in FAKE_CASES
-        if case["id"] == selected_case_id
-    ),
-    None
-)
+case = get_case(selected_case_id)
 
-if selected_case is None:
+if case is None:
     st.error("The selected case could not be found.")
 
     if st.button("← Cases"):
         st.switch_page("pages/cases.py")
 
     st.stop()
+
+
+findings = get_case_findings(selected_case_id)
 
 
 # --------------------------------------------------
@@ -59,7 +57,7 @@ with header_col2:
             font-weight: 600;
             padding-top: 0.4rem;
         ">
-            {selected_case["id"]}
+            {case["case_id"]}
         </div>
         """,
         unsafe_allow_html=True
@@ -73,20 +71,18 @@ with header_col2:
 header_col1, header_col2 = st.columns([3, 1])
 
 with header_col1:
-    st.title(selected_case["type"])
+    st.title("Candidate Case")
 
 with header_col2:
-    priority = selected_case["priority"]
-
     st.markdown(
-        f"""
+        """
         <div style="
             text-align: right;
             font-size: 1.1rem;
             font-weight: 700;
             padding-top: 1.2rem;
         ">
-            {priority.upper()}
+            PENDING
         </div>
         """,
         unsafe_allow_html=True
@@ -97,27 +93,21 @@ with header_col2:
 # Calculate case summary information
 # --------------------------------------------------
 
-events = selected_case.get("events", [])
+source_ips = case["source_ips"]
 
-timestamps = [
-    event["timestamp"]
-    for event in events
-    if event.get("timestamp")
-]
-
-if timestamps:
-    first_seen = min(timestamps)
-    last_seen = max(timestamps)
+if source_ips:
+    source_ip = ", ".join(source_ips)
 else:
-    first_seen = "N/A"
-    last_seen = "N/A"
+    source_ip = "N/A"
 
-event_count = len(events)
+first_seen = case["first_seen"] or "N/A"
+last_seen = case["last_seen"] or "N/A"
 
-source_ip = selected_case.get(
-    "source_ip",
-    "N/A"
-)
+# The current analysis database stores detection findings
+# separately from the raw EVE events.
+# Therefore, the approved "Events" field is not populated
+# with a fabricated value.
+event_count = "Pending"
 
 
 # --------------------------------------------------
@@ -152,28 +142,24 @@ st.divider()
 
 st.subheader("Related Events")
 
-if events:
+if not findings.empty:
+
     related_events = pd.DataFrame([
-        {
-            "Timestamp": event.get(
-                "timestamp",
-                "N/A"
-            ),
-            "Event Type": event.get(
-                "type",
-                "N/A"
-            ),
-            "Destination": (
-                f'{event.get("destination_ip", "N/A")}:'
-                f'{event.get("destination_port", "N/A")}'
-            ),
-            "Details": (
-                "Failed"
-                if "Failed" in event.get("type", "")
-                else "Detected"
+    {
+        "Timestamp": finding["timestamp"],
+        "Event Type": finding["rule_name"],
+        "Destination": (
+            ", ".join(
+                json.loads(finding["details"]).get(
+                    "destination_ips", []
+                )
             )
-        }
-        for event in events
+            if finding["details"]
+            else "N/A"
+        ),
+        "Details": finding["description"],
+    }
+    for _, finding in findings.iterrows()
     ])
 
     st.dataframe(
@@ -192,58 +178,9 @@ else:
 
 st.subheader("MITRE ATT&CK Mapping")
 
-mapping = selected_case.get(
-    "attack_mapping"
+st.info(
+    "No MITRE ATT&CK mapping is currently available."
 )
-
-if mapping:
-    attack_mapping = pd.DataFrame([
-        {
-            "Tactic / Technique": (
-                f'{mapping.get("tactic", "N/A")}\n'
-                f'{mapping.get("technique_id", "N/A")} - '
-                f'{mapping.get("technique", "N/A")}'
-            ),
-            "Confidence": mapping.get(
-                "confidence",
-                "N/A"
-            ),
-            "Evidence": (
-                "Yes"
-                if selected_case.get("evidence")
-                else "No"
-            )
-        }
-    ])
-
-    st.dataframe(
-        attack_mapping,
-        width="stretch",
-        hide_index=True
-    )
-
-    st.markdown("**Mapping Status**")
-
-    st.write(
-        mapping.get(
-            "status",
-            "N/A"
-        )
-    )
-
-    st.markdown("**Reason**")
-
-    st.write(
-        mapping.get(
-            "reason",
-            "No explanation available."
-        )
-    )
-
-else:
-    st.info(
-        "No MITRE ATT&CK mapping is currently available."
-    )
 
 
 # --------------------------------------------------
@@ -254,108 +191,11 @@ st.divider()
 
 st.subheader("Primary Evidence")
 
-evidence = selected_case.get("evidence")
+st.info(
+    "No primary evidence is currently available "
+    "for this case."
+)
 
-if evidence:
-
-    # Get the first event as the primary event.
-    primary_event = events[0] if events else {}
-
-    source_ip = primary_event.get(
-        "source_ip",
-        "N/A"
-    )
-
-    source = evidence.get(
-        "source",
-        ""
-    )
-
-    # Extract source port from the full source endpoint.
-    source_port = "N/A"
-
-    if ":" in source:
-        source_port = source.rsplit(":", 1)[1]
-
-    destination_ip = primary_event.get(
-        "destination_ip",
-        "N/A"
-    )
-
-    destination_port = primary_event.get(
-        "destination_port",
-        "N/A"
-    )
-
-    evidence_fields = [
-        ("EVE ID", "eve_id", evidence.get("eve_id", "N/A")),
-        ("PCAP File", "pcap_file", evidence.get("pcap_file", "N/A")),
-        (
-            "Packet Reference",
-            "packet_reference",
-            evidence.get("packet_reference", "N/A")
-        ),
-        (
-            "Timestamp",
-            "timestamp",
-            evidence.get("timestamp", "N/A")
-        ),
-        ("Source IP", "source_ip", source_ip),
-        ("Source Port", "source_port", source_port),
-        (
-            "Destination IP",
-            "destination_ip",
-            destination_ip
-        ),
-        (
-            "Destination Port",
-            "destination_port",
-            destination_port
-        ),
-        ("Protocol", "protocol", evidence.get("protocol", "N/A"))
-    ]
-
-    for field_name, field_key, value in evidence_fields:
-
-        field_col, value_col = st.columns([1, 2])
-
-        with field_col:
-            st.markdown(f"**{field_name}**")
-
-        with value_col:
-
-            if value != "N/A":
-
-                if st.button(
-                    str(value),
-                    key=(
-                        f"evidence_"
-                        f"{selected_case['id']}_"
-                        f"{field_key}"
-                    ),
-                    type="tertiary"
-                ):
-
-                    st.session_state[
-                        "evidence_search"
-                    ] = str(value)
-
-                    st.session_state[
-                        "evidence_page"
-                    ] = 1
-
-                    st.switch_page(
-                        "pages/evidence.py"
-                    )
-
-            else:
-                st.write("N/A")
-
-else:
-    st.info(
-        "No primary evidence is currently available "
-        "for this case."
-    )
 
 # --------------------------------------------------
 # Notes
@@ -365,12 +205,25 @@ st.divider()
 
 st.subheader("Notes")
 
-st.write(
-    selected_case.get(
-        "description",
-        "No notes are available for this case."
+correlation_strength = case["correlation_strength"]
+
+if correlation_strength == "Single":
+    st.write(
+        "This case contains a single detection finding. "
+        "No additional findings were correlated with it."
     )
-)
+
+else:
+    st.write(
+        f"Correlation strength: **{correlation_strength}**."
+    )
+
+    if case["correlation_reasons"]:
+        st.markdown("**Correlation Reasons**")
+
+        for reason in case["correlation_reasons"]:
+            st.write(f"- {reason}")
+
 
 # --------------------------------------------------
 # Footer
@@ -379,5 +232,6 @@ st.write(
 st.divider()
 
 st.caption(
-    "Prototype dashboard — metrics and case data currently use example values."
+    "Candidate cases are generated from automated detection and correlation. "
+    "They require analyst validation and are not automatically confirmed attacks."
 )

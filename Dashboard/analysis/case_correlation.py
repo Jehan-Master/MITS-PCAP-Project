@@ -46,6 +46,9 @@ def get_flow_ids(finding):
     """Return flow IDs associated with a finding."""
     return set(finding.get("flow_ids", []))
 
+def get_session_ids(finding):
+    """Return session IDs associated with a finding."""
+    return set(finding.get("session_ids", []))
 
 def compare_findings(finding_a, finding_b):
     """
@@ -95,6 +98,11 @@ def compare_findings(finding_a, finding_b):
     shared_flow = bool(
         flows_a & flows_b
     )
+    
+    sessions_a = get_session_ids(finding_a)
+    sessions_b = get_session_ids(finding_b)
+
+    shared_sessions = sessions_a & sessions_b
 
     different_rules = (
         finding_a["rule_id"] != finding_b["rule_id"]
@@ -104,6 +112,12 @@ def compare_findings(finding_a, finding_b):
 
     if shared_flow:
         reasons.append("Shared flow")
+
+    if shared_sessions:
+        for session_id in sorted(shared_sessions):
+            reasons.append(
+                f"Shared session: {session_id}"
+            )
 
     if same_source:
         reasons.append("Same source IP")
@@ -150,6 +164,7 @@ def compare_findings(finding_a, finding_b):
         "correlated": strength is not None,
         "strength": strength,
         "time_difference_seconds": time_difference,
+        "shared_sessions": sorted(shared_sessions),
         "reasons": reasons,
     }
 

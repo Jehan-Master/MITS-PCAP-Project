@@ -2,10 +2,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+import json
 from datetime import timedelta
-
-from data.fake_cases import FAKE_CASES
-
+from data.analysis_data import get_cases, get_case_findings
 
 # --------------------------------------------------
 # Page title
@@ -22,55 +21,70 @@ st.write(
 # Prepare event data
 # --------------------------------------------------
 
+cases = get_cases()
+
 events = []
 
-for case in FAKE_CASES:
-    for event in case.get("events", []):
+for _, case in cases.iterrows():
+    case_findings = get_case_findings(case["case_id"])
+
+    for _, finding in case_findings.iterrows():
+        details = finding["details"]
+
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except json.JSONDecodeError:
+                details = {}
+
+        destination_ips = details.get(
+            "destination_ips",
+            []
+        )
+
+        if isinstance(destination_ips, str):
+            destination_ips = [destination_ips]
+
         events.append(
             {
-                "Case ID": case["id"],
-                "Timestamp": event.get("timestamp"),
-                "Event Type": event.get("type", "Unknown"),
-                "Source IP": event.get("source_ip", "N/A"),
-                "Destination IP": event.get(
-                    "destination_ip",
-                    "N/A"
-                ),
-                "Destination Port": event.get(
-                    "destination_port",
-                    "N/A"
-                ),
-                "Protocol": event.get(
-                    "protocol",
-                    "N/A"
-                ),
-                "Priority": case.get(
-                    "priority",
-                    "Low"
-                ),
-                "Evidence": event.get(
-                    "evidence",
-                    "N/A"
+                "Case ID": case["case_id"],
+                "Timestamp": finding["timestamp"],
+                "Event Type": finding["rule_name"],
+                "Source IP": finding["source_ip"]
+                or "N/A",
+                "Destination IP": ", ".join(
+                    str(ip)
+                    for ip in destination_ips
                 )
+                or "N/A",
+                "Destination Port": "N/A",
+                "Protocol": "N/A",
+                "Priority": finding["priority"]
+                or "N/A",
+                "Evidence": (
+                    ", ".join(
+                        str(event_id)
+                        for event_id in finding["event_ids"]
+                    )
+                    if finding["event_ids"]
+                    else "N/A"
+                ),
             }
         )
 
+        events_df = pd.DataFrame(events)
 
-if not events:
-    st.info("No events are currently available.")
-    st.stop()
+        if events_df.empty:
+            st.info("No events are currently available.")
+            st.stop()
 
+        events_df["Timestamp"] = pd.to_datetime(
+            events_df["Timestamp"]
+        )
 
-events_df = pd.DataFrame(events)
-
-events_df["Timestamp"] = pd.to_datetime(
-    events_df["Timestamp"]
-)
-
-events_df = events_df.sort_values(
-    "Timestamp"
-)
-
+        events_df = events_df.sort_values(
+            "Timestamp"
+        )
 
 # --------------------------------------------------
 # Determine available time range
@@ -82,7 +96,6 @@ available_years = sorted(
     events_df["Timestamp"].dt.year.unique(),
     reverse=True
 )
-
 
 # --------------------------------------------------
 # Timeframe selector
@@ -271,6 +284,6 @@ else:
 st.divider()
 
 st.caption(
-    "Prototype dashboard — timeline data currently represents "
-    "example values."
+    "Prototype dashboard — timeline data is generated from "
+    "the current analysis results."
 )

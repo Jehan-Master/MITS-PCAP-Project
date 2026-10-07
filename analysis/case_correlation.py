@@ -46,6 +46,9 @@ def get_flow_ids(finding):
     """Return flow IDs associated with a finding."""
     return set(finding.get("flow_ids", []))
 
+def get_session_ids(finding):
+    """Return session IDs associated with a finding."""
+    return set(finding.get("session_ids", []))
 
 def compare_findings(finding_a, finding_b):
     """
@@ -95,6 +98,11 @@ def compare_findings(finding_a, finding_b):
     shared_flow = bool(
         flows_a & flows_b
     )
+    
+    sessions_a = get_session_ids(finding_a)
+    sessions_b = get_session_ids(finding_b)
+
+    shared_sessions = sessions_a & sessions_b
 
     different_rules = (
         finding_a["rule_id"] != finding_b["rule_id"]
@@ -104,6 +112,12 @@ def compare_findings(finding_a, finding_b):
 
     if shared_flow:
         reasons.append("Shared flow")
+
+    if shared_sessions:
+        for session_id in sorted(shared_sessions):
+            reasons.append(
+                f"Shared session: {session_id}"
+            )
 
     if same_source:
         reasons.append("Same source IP")
@@ -150,6 +164,7 @@ def compare_findings(finding_a, finding_b):
         "correlated": strength is not None,
         "strength": strength,
         "time_difference_seconds": time_difference,
+        "shared_sessions": sorted(shared_sessions),
         "reasons": reasons,
     }
 
@@ -160,22 +175,21 @@ def compare_findings(finding_a, finding_b):
 def build_candidate_cases(findings):
     """
     Group correlated findings into candidate cases.
+
+    Findings are expected to already contain a finding_id.
+    The pipeline assigns these IDs once before correlation.
     """
 
-    finding_count = len(findings)
-
-    # Assign stable IDs
     finding_records = []
 
-    for index, finding in enumerate(
-        findings,
-        start=1,
-    ):
+    for finding in findings:
         record = finding.copy()
-        record["finding_id"] = get_finding_id(
-            finding,
-            index,
-        )
+
+        if "finding_id" not in record:
+            raise ValueError(
+                "Finding is missing required finding_id."
+            )
+
         finding_records.append(record)
 
     # Build a graph of correlated findings
@@ -759,7 +773,7 @@ if __name__ == "__main__":
             f"{case['correlation_strength']} | "
             f"{case['source_ips']}"
         )
-        
+
     # --------------------------------------------------------
     # Print candidate cases
     # --------------------------------------------------------

@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 
 from data.fake_cases import FAKE_CASES
+from data.analysis_data import get_cases, get_case_findings, get_events_by_ids, get_suricata_alerts
 
 
 # --------------------------------------------------
@@ -15,39 +16,82 @@ st.title("Evidence")
 # Prepare evidence data
 # --------------------------------------------------
 
+cases = get_cases()
+
 evidence_rows = []
 
-for case in FAKE_CASES:
-    case_evidence = case.get("evidence", {})
+for _, case in cases.iterrows():
+    case_findings = get_case_findings(
+        case["case_id"]
+    )
 
-    for event in case.get("events", []):
-        source = case_evidence.get("source", "")
-        source_port = "N/A"
+    for _, finding in case_findings.iterrows():
+        event_ids = finding["event_ids"]
 
-        if ":" in source:
-            source_port = source.rsplit(":", 1)[1]
+        if not event_ids:
+            continue
 
-        evidence_rows.append({
-            "Timestamp": event.get("timestamp", "N/A"),
-            "Source IP": event.get("source_ip", "N/A"),
-            "Source Port": source_port,
-            "Destination IP": event.get("destination_ip", "N/A"),
-            "Destination Port": event.get("destination_port", "N/A"),
-            "Protocol": event.get("protocol", "N/A"),
-            "Info": event.get("type", "N/A"),
-            "Case ID": case.get("id", "N/A"),
-            "Evidence ID": event.get("evidence", "N/A"),
-            "PCAP File": case_evidence.get("pcap_file", "N/A"),
-            "Packet Reference": case_evidence.get("packet_reference", "N/A")
-        })
+        events = get_events_by_ids(
+            event_ids
+        )
+
+        for _, event in events.iterrows():
+            evidence_rows.append(
+                {
+                    "Timestamp": event["ts"],
+                    "Source IP": event["src_ip"] or "N/A",
+                    "Source Port": (
+                        event["src_port"]
+                        if pd.notna(event["src_port"])
+                        else "N/A"
+                    ),
+                    "Destination IP": (
+                        event["dest_ip"] or "N/A"
+                    ),
+                    "Destination Port": (
+                        event["dest_port"]
+                        if pd.notna(event["dest_port"])
+                        else "N/A"
+                    ),
+                    "Protocol": (
+                        event["proto"] or "N/A"
+                    ),
+                    "Info": (
+                        event["event_type"] or "N/A"
+                    ),
+                    "Case ID": case["case_id"],
+                    "EVE ID": event["id"],
+                    "PCAP File": "N/A",
+                    "Packet Reference": "N/A",
+                    "Alert SID": (
+                        event["alert_sid"]
+                        if pd.notna(event["alert_sid"])
+                        else None
+                    ),
+                    "Alert Signature": (
+                        event["alert_signature"]
+                        if event["alert_signature"]
+                        else "N/A"
+                    ),
+                    "Alert Severity": (
+                        event["alert_severity"]
+                        if pd.notna(event["alert_severity"])
+                        else "N/A"
+                    ),
+                }
+            )
 
 
 if not evidence_rows:
-    st.info("No evidence is currently available.")
+    st.info(
+        "No EVE-JSON evidence is currently available."
+    )
     st.stop()
 
 
-evidence_df = pd.DataFrame(evidence_rows)
+evidence_df = pd.DataFrame(
+    evidence_rows
+)
 
 evidence_df["Timestamp"] = pd.to_datetime(
     evidence_df["Timestamp"]
@@ -56,7 +100,6 @@ evidence_df["Timestamp"] = pd.to_datetime(
 evidence_df = evidence_df.sort_values(
     "Timestamp"
 )
-
 
 # --------------------------------------------------
 # Search and filter
@@ -143,7 +186,7 @@ if search_query:
 
         |
 
-        filtered_evidence["Evidence ID"]
+        filtered_evidence["EVE ID"]
         .astype(str)
         .str.lower()
         .str.contains(search_query, na=False)
@@ -243,37 +286,11 @@ with pcap_tab:
 
     st.subheader("PCAP Evidence")
 
-    if filtered_evidence.empty:
-        st.info(
-            "No PCAP evidence matches the current filters."
-        )
-
-    else:
-        display_df = page_evidence.copy()
-
-        display_df["Timestamp"] = (
-            display_df["Timestamp"]
-            .dt.strftime("%Y-%m-%d %H:%M:%S")
-        )
-
-        display_df = display_df[
-            [
-                "Timestamp",
-                "Source IP",
-                "Source Port",
-                "Destination IP",
-                "Destination Port",
-                "Protocol",
-                "Info"
-            ]
-        ]
-
-        st.dataframe(
-            display_df,
-            width="stretch",
-            hide_index=True
-        )
-
+    st.info(
+        "PCAP packet-level evidence is not currently linked "
+        "to the detected findings. Use the EVE-JSON tab to "
+        "inspect the available event-level evidence."
+    )
 
 # --------------------------------------------------
 # EVE-JSON tab
@@ -299,7 +316,7 @@ with eve_tab:
         eve_display_df = eve_display_df[
             [
                 "Timestamp",
-                "Evidence ID",
+                "EVE ID",
                 "Source IP",
                 "Source Port",
                 "Destination IP",
@@ -324,40 +341,78 @@ with suricata_tab:
 
     st.subheader("Suricata Alerts")
 
-    # For now, create representative alert data
-    # from the fake suspicious events.
-    alert_rows = []
-
-    for _, row in filtered_evidence.iterrows():
-        alert_rows.append(
-            {
-                "Timestamp": row["Timestamp"],
-                "Alert": row["Info"],
-                "Source IP": row["Source IP"],
-                "Destination IP": row["Destination IP"],
-                "Protocol": row["Protocol"]
-            }
-        )
-
-    alert_df = pd.DataFrame(alert_rows)
+    alert_df = get_suricata_alerts()
 
     if alert_df.empty:
         st.info(
-            "No Suricata alerts match the current filters."
+            "No Suricata alerts are available in the "
+            "current EVE-JSON data."
         )
 
     else:
-        alert_df["Timestamp"] = (
-            alert_df["Timestamp"]
-            .dt.strftime("%Y-%m-%d %H:%M:%S")
+        alert_df["Timestamp"] = pd.to_datetime(
+            alert_df["ts"]
         )
 
-        st.dataframe(
-            alert_df,
-            width="stretch",
-            hide_index=True
+        alert_df = alert_df[
+            [
+                "Timestamp",
+                "alert_sid",
+                "alert_signature",
+                "src_ip",
+                "dest_ip",
+                "proto",
+                "alert_severity",
+            ]
+        ]
+
+        alert_df = alert_df.rename(
+            columns={
+                "alert_sid": "Alert SID",
+                "alert_signature": "Alert",
+                "src_ip": "Source IP",
+                "dest_ip": "Destination IP",
+                "proto": "Protocol",
+                "alert_severity": "Severity",
+            }
         )
 
+        if filter_option != "All":
+            alert_df = alert_df[
+                alert_df["Protocol"] == filter_option
+            ]
+
+        if search_query:
+            search_mask = (
+                alert_df.astype(str)
+                .apply(
+                    lambda column: column.str.lower()
+                    .str.contains(
+                        search_query,
+                        na=False
+                    )
+                )
+                .any(axis=1)
+            )
+
+            alert_df = alert_df[search_mask]
+
+        if alert_df.empty:
+            st.info(
+                "No Suricata alerts match the current filters."
+            )
+
+        else:
+            alert_df["Timestamp"] = (
+                alert_df["Timestamp"]
+                .dt.strftime("%Y-%m-%d %H:%M:%S")
+            )
+
+            st.dataframe(
+                alert_df,
+                width="stretch",
+                hide_index=True
+            )
 
 # --------------------------------------------------
 # Pagination controls
@@ -431,6 +486,6 @@ with info_col2:
 # --------------------------------------------------
 
 st.caption(
-    "Prototype dashboard — evidence currently represents "
-    "example values derived from the fake case dataset."
+    "Prototype dashboard — evidence is generated from "
+    "the current analysis database."
 )
