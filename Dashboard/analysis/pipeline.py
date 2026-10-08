@@ -26,10 +26,11 @@ from analysis.detection import (
     load_events,
 )
 from analysis.ingest import ingest_file, open_database, print_summary
+from AnomalyDetection.anomaly_detection import run_analysis as run_anomaly_analysis
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATABASE_FILE = PROJECT_ROOT / "database" / "mits_test.db"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DATABASE_FILE = REPOSITORY_ROOT / "database" / "mits.db"
 
 
 FINDINGS_SCHEMA = """
@@ -253,9 +254,9 @@ def run_session_correlation(connection):
     return sessions
 
 
-def run_detection():
+def run_detection(database_path):
     """Run all currently implemented rule-based detection rules."""
-    events = load_events()
+    events = load_events(database_path)
 
     r01 = build_high_connection_findings(events)
     r02 = build_multi_port_findings(events)
@@ -268,10 +269,21 @@ def run_detection():
     return events, findings
 
 
-def run_pipeline(database_path=DATABASE_FILE, input_files=None):
+def run_pipeline(
+    database_path=DATABASE_FILE,
+    input_files=None,
+    with_anomaly=False,
+    anomaly_window_seconds=60,
+    anomaly_threshold=3.5,
+    anomaly_min_source_windows=5,
+):
     """Run ingestion (when requested), correlation, detection and case creation.
 
     Returns a dictionary containing the in-memory results from the run.
+
+    Statistical anomaly detection is optional because it is a separate detector
+    from the existing rule-based detection pipeline. When enabled, it reads the
+    same shared SQLite events table and stores its own derived anomaly tables.
     """
     database_path = Path(database_path)
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,18 +332,9 @@ def run_pipeline(database_path=DATABASE_FILE, input_files=None):
             "Run ingestion first or provide an existing database."
         )
 
-    # The current detection module reads the project's configured database
-    # path directly. Keep the pipeline explicit about that constraint rather
-    # than silently analysing a different database.
-    if database_path.resolve() != DATABASE_FILE.resolve():
-        raise ValueError(
-            "The current detection module uses database/mits_test.db "
-            "directly. Run the pipeline with the project's default database."
-        )
-
     with sqlite3.connect(database_path) as connection:
         sessions = run_session_correlation(connection)
-        events, findings = run_detection()
+        events, findings = run_detection(database_path)
 
         findings = normalize_findings(findings)
         
@@ -351,6 +354,15 @@ def run_pipeline(database_path=DATABASE_FILE, input_files=None):
 
         connection.commit()
 
+    anomaly_result = None
+    if with_anomaly:
+        anomaly_result = run_anomaly_analysis(
+            database_path,
+            window_seconds=anomaly_window_seconds,
+            threshold=anomaly_threshold,
+            min_source_windows=anomaly_min_source_windows,
+        )
+
     return {
         "event_count": len(events),
         "session_count": len(sessions),
@@ -358,6 +370,7 @@ def run_pipeline(database_path=DATABASE_FILE, input_files=None):
         "case_count": len(cases),
         "findings": findings,
         "cases": cases,
+        "anomaly_result": anomaly_result,
     }
 
 
@@ -377,6 +390,29 @@ def parse_arguments():
         default=DATABASE_FILE,
         help="path to the project SQLite database",
     )
+    parser.add_argument(
+        "--with-anomaly",
+        action="store_true",
+        help="run statistical anomaly detection after case generation",
+    )
+    parser.add_argument(
+        "--anomaly-window-seconds",
+        type=int,
+        default=60,
+        help="time-window size used by anomaly detection (default: 60)",
+    )
+    parser.add_argument(
+        "--anomaly-threshold",
+        type=float,
+        default=3.5,
+        help="modified z-score threshold used by anomaly detection (default: 3.5)",
+    )
+    parser.add_argument(
+        "--anomaly-min-source-windows",
+        type=int,
+        default=5,
+        help="minimum source windows required for a source baseline (default: 5)",
+    )
     return parser.parse_args()
 
 
@@ -392,6 +428,10 @@ def main():
         results = run_pipeline(
             database_path=arguments.db,
             input_files=arguments.inputs or None,
+            with_anomaly=arguments.with_anomaly,
+            anomaly_window_seconds=arguments.anomaly_window_seconds,
+            anomaly_threshold=arguments.anomaly_threshold,
+            anomaly_min_source_windows=arguments.anomaly_min_source_windows,
         )
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"Pipeline failed: {error}")
@@ -404,6 +444,14 @@ def main():
     print(f"Sessions:  {results['session_count']:,}")
     print(f"Findings:  {results['finding_count']:,}")
     print(f"Cases:     {results['case_count']:,}")
+
+    anomaly_result = results.get("anomaly_result")
+    if anomaly_result is not None:
+        print(f"Anomaly windows:  {anomaly_result.windows_created:,}")
+        print(f"Anomaly baselines:{anomaly_result.baselines_created:,}")
+        print(f"Anomaly findings: {anomaly_result.findings_created:,}")
+        print(f"Anomaly links:    {anomaly_result.event_links_created:,}")
+
     print("Analysis results saved to SQLite.")
     return 0
 

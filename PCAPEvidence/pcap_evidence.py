@@ -1,18 +1,17 @@
 """Connect correlated MITS cases to packet-level PCAP evidence.
 
-This module is intentionally built around the SQLite contract produced by the
-correlation branch:
+The current MITS pipeline stores case relationships as::
 
-    cases(case_id, src_ip, dest_ip, dest_port, protocol, first_seen, last_seen, ...)
-    case_flows(case_id, flow_id)
+    cases
+      -> case_findings
+      -> findings(event_ids, flow_ids)
+      -> events
 
-If the ingestion ``events`` table is present in the same SQLite database, the
-module also creates case -> EVE event links by joining ``case_flows.flow_id`` to
-``events.flow_id``.
-
-Raw PCAP files do not contain Suricata ``flow_id`` values, so packet matching is
-performed using the correlated case's endpoints, destination/service port,
-protocol and time window. TShark is used to read PCAP/PCAPNG files.
+Raw PCAP/PCAPNG files do not contain Suricata ``flow_id`` values.  This module
+therefore resolves each case back to its supporting EVE events, derives the
+network tuples and time windows from those events, and asks TShark for the
+matching packets.  Packet references are then stored in the same SQLite
+database so the dashboard can trace a case back to both EVE and PCAP evidence.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -30,17 +30,30 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 DEFAULT_PADDING_SECONDS = 2.0
+SQLITE_IN_CHUNK = 900
 
-REQUIRED_CASE_COLUMNS = {
-    "case_id",
-    "src_ip",
-    "dest_ip",
-    "dest_port",
-    "protocol",
-    "first_seen",
-    "last_seen",
+# Windows' CreateProcess has a hard ~32,767 character command-line limit, and
+# raises WinError 206 ("The filename or extension is too long") once the
+# combined argv length goes over it. Cases with many flows build very long
+# "-Y" display filters (one OR'd clause per packet selector), so filters are
+# split into batches that stay comfortably under that limit on every OS.
+MAX_DISPLAY_FILTER_LENGTH = 6000
+
+REQUIRED_TABLE_COLUMNS = {
+    "cases": {"case_id", "first_seen", "last_seen"},
+    "case_findings": {"case_id", "finding_id"},
+    "findings": {"finding_id", "event_ids", "flow_ids"},
+    "events": {
+        "id",
+        "ts",
+        "flow_id",
+        "src_ip",
+        "src_port",
+        "dest_ip",
+        "dest_port",
+        "proto",
+    },
 }
-REQUIRED_CASE_FLOW_COLUMNS = {"case_id", "flow_id"}
 
 TSHARK_FIELDS = (
     "frame.number",
@@ -87,14 +100,15 @@ CREATE TABLE IF NOT EXISTS pcap_evidence (
     is_retransmission INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT    NOT NULL,
     UNIQUE (case_id, pcap_path, packet_number),
-    FOREIGN KEY (case_id) REFERENCES cases(case_id)
+    FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS case_eve_events (
     case_id  TEXT    NOT NULL,
     event_id INTEGER NOT NULL,
     PRIMARY KEY (case_id, event_id),
-    FOREIGN KEY (case_id) REFERENCES cases(case_id)
+    FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_pcap_evidence_case
@@ -137,15 +151,27 @@ INSERT OR IGNORE INTO pcap_evidence (
 
 
 @dataclass(frozen=True)
-class Case:
-    case_id: str
+class FlowSelector:
+    """One network tuple/time range that supports a correlated case."""
+
     src_ip: str
+    src_port: int | None
     dest_ip: str
     dest_port: int | None
     protocol: str | None
     first_seen: datetime
     last_seen: datetime
+
+
+@dataclass(frozen=True)
+class Case:
+    case_id: str
+    first_seen: datetime
+    last_seen: datetime
+    finding_ids: tuple[str, ...]
+    event_ids: tuple[int, ...]
     flow_ids: tuple[int, ...]
+    selectors: tuple[FlowSelector, ...]
 
 
 @dataclass(frozen=True)
@@ -167,8 +193,8 @@ class PacketEvidence:
 
 
 def parse_timestamp(value: str) -> datetime:
-    """Parse ISO timestamps used by Suricata and the correlation script."""
-    value = value.strip()
+    """Parse ISO timestamps used by Suricata/pandas and normalize to UTC-aware."""
+    value = str(value).strip()
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     if len(value) >= 5 and value[-5] in ("+", "-") and value[-3] != ":":
@@ -187,7 +213,7 @@ def iso_from_epoch(epoch: float) -> str:
 def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
     return (
         connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             (table_name,),
         ).fetchone()
         is not None
@@ -202,26 +228,16 @@ def table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
 
 
 def validate_correlation_schema(connection: sqlite3.Connection) -> None:
-    """Validate the exact minimum SQLite contract Task 4 needs."""
-    if not table_exists(connection, "cases"):
-        raise RuntimeError("Missing required SQLite table: cases")
-    if not table_exists(connection, "case_flows"):
-        raise RuntimeError("Missing required SQLite table: case_flows")
-
-    missing_cases = REQUIRED_CASE_COLUMNS - table_columns(connection, "cases")
-    missing_case_flows = REQUIRED_CASE_FLOW_COLUMNS - table_columns(
-        connection, "case_flows"
-    )
-    if missing_cases:
-        raise RuntimeError(
-            "cases table is missing required columns: "
-            + ", ".join(sorted(missing_cases))
-        )
-    if missing_case_flows:
-        raise RuntimeError(
-            "case_flows table is missing required columns: "
-            + ", ".join(sorted(missing_case_flows))
-        )
+    """Validate the SQLite contract produced by the current analysis pipeline."""
+    for table_name, required_columns in REQUIRED_TABLE_COLUMNS.items():
+        if not table_exists(connection, table_name):
+            raise RuntimeError(f"Missing required SQLite table: {table_name}")
+        missing = required_columns - table_columns(connection, table_name)
+        if missing:
+            raise RuntimeError(
+                f"{table_name} table is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
 
 
 def ensure_evidence_tables(connection: sqlite3.Connection) -> None:
@@ -229,33 +245,154 @@ def ensure_evidence_tables(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-def populate_case_event_links(connection: sqlite3.Connection) -> int:
-    """Link cases to ingested EVE rows when ``events`` exists in the same DB.
+def _parse_int_list(raw_value: object) -> list[int]:
+    """Read an ID list persisted as JSON; tolerate stringified numeric IDs."""
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, (list, tuple)):
+        values = raw_value
+    else:
+        try:
+            values = json.loads(str(raw_value))
+        except (json.JSONDecodeError, TypeError):
+            return []
 
-    This is the future shared-SQLite integration point. The current correlation
-    branch already stores ``case_flows``. Once ingestion and correlation use the
-    same database, this join makes the EVE evidence traceable without rereading
-    the raw JSON file.
-    """
-    if not table_exists(connection, "events"):
-        return 0
+    if not isinstance(values, list):
+        return []
 
-    event_columns = table_columns(connection, "events")
-    if not {"id", "flow_id"}.issubset(event_columns):
-        raise RuntimeError("events table must contain id and flow_id columns")
+    result: list[int] = []
+    for value in values:
+        try:
+            result.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
 
-    before = connection.total_changes
-    connection.execute(
+
+def _chunks(values: Sequence[int], size: int = SQLITE_IN_CHUNK):
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def _case_references(
+    connection: sqlite3.Connection,
+    case_id: str,
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return finding, event and flow IDs supporting one case."""
+    rows = connection.execute(
         """
-        INSERT OR IGNORE INTO case_eve_events (case_id, event_id)
-        SELECT cf.case_id, e.id
-        FROM case_flows AS cf
-        JOIN events AS e ON e.flow_id = cf.flow_id
-        WHERE e.flow_id IS NOT NULL
-        """
+        SELECT f.finding_id, f.event_ids, f.flow_ids
+        FROM case_findings AS cf
+        JOIN findings AS f ON f.finding_id = cf.finding_id
+        WHERE cf.case_id = ?
+        ORDER BY f.finding_id
+        """,
+        (case_id,),
+    ).fetchall()
+
+    finding_ids: list[str] = []
+    event_ids: set[int] = set()
+    flow_ids: set[int] = set()
+    for finding_id, raw_event_ids, raw_flow_ids in rows:
+        finding_ids.append(str(finding_id))
+        event_ids.update(_parse_int_list(raw_event_ids))
+        flow_ids.update(_parse_int_list(raw_flow_ids))
+
+    return (
+        tuple(finding_ids),
+        tuple(sorted(event_ids)),
+        tuple(sorted(flow_ids)),
     )
-    connection.commit()
-    return connection.total_changes - before
+
+
+def _load_supporting_events(
+    connection: sqlite3.Connection,
+    event_ids: Sequence[int],
+    flow_ids: Sequence[int],
+) -> list[sqlite3.Row]:
+    """Resolve finding references to the concrete EVE rows needed for PCAP filters."""
+    previous_factory = connection.row_factory
+    connection.row_factory = sqlite3.Row
+    events: dict[int, sqlite3.Row] = {}
+    try:
+        for chunk in _chunks(list(event_ids)):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in connection.execute(
+                f"""
+                SELECT id, ts, flow_id, src_ip, src_port, dest_ip, dest_port, proto
+                FROM events
+                WHERE id IN ({placeholders})
+                """,
+                chunk,
+            ):
+                events[int(row["id"])] = row
+
+        for chunk in _chunks(list(flow_ids)):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in connection.execute(
+                f"""
+                SELECT id, ts, flow_id, src_ip, src_port, dest_ip, dest_port, proto
+                FROM events
+                WHERE flow_id IN ({placeholders})
+                """,
+                chunk,
+            ):
+                events[int(row["id"])] = row
+    finally:
+        connection.row_factory = previous_factory
+
+    return sorted(events.values(), key=lambda row: (str(row["ts"]), int(row["id"])))
+
+
+def _selectors_from_events(rows: Sequence[sqlite3.Row]) -> tuple[FlowSelector, ...]:
+    """Collapse supporting EVE rows into unique network tuples with time ranges."""
+    groups: dict[tuple[object, ...], dict[str, object]] = {}
+
+    for row in rows:
+        if not row["ts"] or not row["src_ip"] or not row["dest_ip"]:
+            continue
+
+        try:
+            timestamp = parse_timestamp(row["ts"])
+        except (ValueError, TypeError):
+            continue
+
+        key = (
+            str(row["src_ip"]),
+            row["src_port"],
+            str(row["dest_ip"]),
+            row["dest_port"],
+            str(row["proto"]) if row["proto"] else None,
+        )
+        existing = groups.get(key)
+        if existing is None:
+            groups[key] = {"first_seen": timestamp, "last_seen": timestamp}
+        else:
+            existing["first_seen"] = min(existing["first_seen"], timestamp)
+            existing["last_seen"] = max(existing["last_seen"], timestamp)
+
+    selectors = [
+        FlowSelector(
+            src_ip=key[0],
+            src_port=key[1],
+            dest_ip=key[2],
+            dest_port=key[3],
+            protocol=key[4],
+            first_seen=value["first_seen"],
+            last_seen=value["last_seen"],
+        )
+        for key, value in groups.items()
+    ]
+    selectors.sort(
+        key=lambda selector: (
+            selector.first_seen,
+            selector.src_ip,
+            selector.dest_ip,
+            selector.src_port or -1,
+            selector.dest_port or -1,
+        )
+    )
+    return tuple(selectors)
 
 
 def load_cases(
@@ -263,26 +400,15 @@ def load_cases(
     case_ids: Sequence[str] | None = None,
     limit: int | None = None,
 ) -> list[Case]:
+    """Load cases and resolve their findings back to EVE network tuples."""
     validate_correlation_schema(connection)
 
-    sql = """
-        SELECT
-            case_id,
-            src_ip,
-            dest_ip,
-            dest_port,
-            protocol,
-            first_seen,
-            last_seen
-        FROM cases
-    """
+    sql = "SELECT case_id, first_seen, last_seen FROM cases"
     parameters: list[object] = []
-
     if case_ids:
         placeholders = ", ".join("?" for _ in case_ids)
         sql += f" WHERE case_id IN ({placeholders})"
         parameters.extend(case_ids)
-
     sql += " ORDER BY first_seen, case_id"
     if limit is not None:
         sql += " LIMIT ?"
@@ -291,41 +417,63 @@ def load_cases(
     rows = connection.execute(sql, parameters).fetchall()
     result: list[Case] = []
 
-    for row in rows:
-        flow_ids = tuple(
-            item[0]
-            for item in connection.execute(
-                """
-                SELECT flow_id
-                FROM case_flows
-                WHERE case_id = ?
-                ORDER BY flow_id
-                """,
-                (row[0],),
-            ).fetchall()
+    for case_id, first_seen_raw, last_seen_raw in rows:
+        finding_ids, direct_event_ids, flow_ids = _case_references(connection, case_id)
+        supporting_events = _load_supporting_events(
+            connection,
+            direct_event_ids,
+            flow_ids,
         )
+        resolved_event_ids = tuple(sorted(int(row["id"]) for row in supporting_events))
+        selectors = _selectors_from_events(supporting_events)
 
-        if not row[1] or not row[2] or not row[5] or not row[6]:
+        if not finding_ids:
             print(
-                f"Warning: skipping {row[0]} because endpoint/time data is incomplete.",
+                f"Warning: skipping {case_id}; it has no linked findings.",
+                file=sys.stderr,
+            )
+            continue
+        if not selectors:
+            print(
+                f"Warning: skipping {case_id}; supporting findings did not resolve "
+                "to usable event endpoint/time data.",
                 file=sys.stderr,
             )
             continue
 
         result.append(
             Case(
-                case_id=row[0],
-                src_ip=row[1],
-                dest_ip=row[2],
-                dest_port=row[3],
-                protocol=row[4],
-                first_seen=parse_timestamp(row[5]),
-                last_seen=parse_timestamp(row[6]),
+                case_id=str(case_id),
+                first_seen=parse_timestamp(first_seen_raw),
+                last_seen=parse_timestamp(last_seen_raw),
+                finding_ids=finding_ids,
+                event_ids=resolved_event_ids,
                 flow_ids=flow_ids,
+                selectors=selectors,
             )
         )
 
     return result
+
+
+def populate_case_event_links(connection: sqlite3.Connection) -> int:
+    """Persist case -> EVE links derived from case findings and finding flow IDs."""
+    validate_correlation_schema(connection)
+    before = connection.total_changes
+
+    case_ids = [row[0] for row in connection.execute("SELECT case_id FROM cases")]
+    rows: list[tuple[str, int]] = []
+    for case_id in case_ids:
+        _, event_ids, flow_ids = _case_references(connection, case_id)
+        supporting_events = _load_supporting_events(connection, event_ids, flow_ids)
+        rows.extend((str(case_id), int(row["id"])) for row in supporting_events)
+
+    connection.executemany(
+        "INSERT OR IGNORE INTO case_eve_events(case_id, event_id) VALUES (?, ?)",
+        rows,
+    )
+    connection.commit()
+    return connection.total_changes - before
 
 
 def _address_fields(ip: str) -> tuple[str, str]:
@@ -334,72 +482,113 @@ def _address_fields(ip: str) -> tuple[str, str]:
     return "ip.src", "ip.dst"
 
 
-def build_display_filter(case: Case, padding_seconds: float) -> str:
-    """Create a bidirectional TShark display filter for one case.
+def _selector_filter(selector: FlowSelector, padding_seconds: float) -> str:
+    if (":" in selector.src_ip) != (":" in selector.dest_ip):
+        raise ValueError("A selector mixes IPv4 and IPv6 endpoints")
 
-    ``flow_id`` cannot be used because it is generated by Suricata and is not a
-    field stored in raw PCAP packets. The filter therefore uses the same tuple
-    the correlation groups by: source, destination, destination/service port,
-    protocol and time.
-    """
-    if (":" in case.src_ip) != (":" in case.dest_ip):
-        raise ValueError(f"{case.case_id} mixes IPv4 and IPv6 endpoints")
+    src_source_field, src_dest_field = _address_fields(selector.src_ip)
+    dst_source_field, dst_dest_field = _address_fields(selector.dest_ip)
 
-    src_source_field, src_dest_field = _address_fields(case.src_ip)
-    dst_source_field, dst_dest_field = _address_fields(case.dest_ip)
-
-    start_epoch = case.first_seen.timestamp() - padding_seconds
-    end_epoch = case.last_seen.timestamp() + padding_seconds
-
-    protocol = (case.protocol or "").strip().lower()
+    protocol = (selector.protocol or "").strip().lower()
+    protocol_clause = ""
     if protocol == "tcp":
         protocol_clause = "tcp"
-        forward_port = (
-            f" && tcp.dstport == {case.dest_port}"
-            if case.dest_port is not None
-            else ""
-        )
-        reverse_port = (
-            f" && tcp.srcport == {case.dest_port}"
-            if case.dest_port is not None
-            else ""
-        )
+        src_port_field = "tcp.srcport"
+        dest_port_field = "tcp.dstport"
     elif protocol == "udp":
         protocol_clause = "udp"
-        forward_port = (
-            f" && udp.dstport == {case.dest_port}"
-            if case.dest_port is not None
-            else ""
-        )
-        reverse_port = (
-            f" && udp.srcport == {case.dest_port}"
-            if case.dest_port is not None
-            else ""
-        )
+        src_port_field = "udp.srcport"
+        dest_port_field = "udp.dstport"
     else:
-        protocol_clause = protocol
-        forward_port = ""
-        reverse_port = ""
+        src_port_field = None
+        dest_port_field = None
+        if protocol:
+            protocol_clause = protocol
 
-    forward = (
-        f"({src_source_field} == {case.src_ip} && "
-        f"{dst_dest_field} == {case.dest_ip}{forward_port})"
-    )
-    reverse = (
-        f"({dst_source_field} == {case.dest_ip} && "
-        f"{src_dest_field} == {case.src_ip}{reverse_port})"
-    )
+    forward_parts = [
+        f"{src_source_field} == {selector.src_ip}",
+        f"{dst_dest_field} == {selector.dest_ip}",
+    ]
+    reverse_parts = [
+        f"{dst_source_field} == {selector.dest_ip}",
+        f"{src_dest_field} == {selector.src_ip}",
+    ]
 
-    endpoint_clause = f"({forward} || {reverse})"
+    if src_port_field and selector.src_port is not None:
+        forward_parts.append(f"{src_port_field} == {selector.src_port}")
+        reverse_parts.append(f"{dest_port_field} == {selector.src_port}")
+    if dest_port_field and selector.dest_port is not None:
+        forward_parts.append(f"{dest_port_field} == {selector.dest_port}")
+        reverse_parts.append(f"{src_port_field} == {selector.dest_port}")
+
+    start_epoch = selector.first_seen.timestamp() - padding_seconds
+    end_epoch = selector.last_seen.timestamp() + padding_seconds
+    endpoint_clause = (
+        f"(({' && '.join(forward_parts)}) || ({' && '.join(reverse_parts)}))"
+    )
     time_clause = (
         f"frame.time_epoch >= {start_epoch:.6f} && "
         f"frame.time_epoch <= {end_epoch:.6f}"
     )
-
-    clauses = [endpoint_clause, time_clause]
+    parts = [endpoint_clause, time_clause]
     if protocol_clause:
-        clauses.insert(0, protocol_clause)
-    return " && ".join(clauses)
+        parts.insert(0, protocol_clause)
+    return " && ".join(parts)
+
+
+def build_display_filter(case: Case, padding_seconds: float) -> str:
+    """Build a case filter as the OR of its supporting event network tuples."""
+    if not case.selectors:
+        raise ValueError(f"{case.case_id} has no usable packet selectors")
+    selector_filters = [
+        f"({_selector_filter(selector, padding_seconds)})"
+        for selector in case.selectors
+    ]
+    return " || ".join(selector_filters)
+
+
+def build_display_filter_batches(
+    case: Case,
+    padding_seconds: float,
+    max_length: int = MAX_DISPLAY_FILTER_LENGTH,
+) -> list[str]:
+    """Build one or more display filters for a case, each under max_length.
+
+    Cases with many flows produce a very long OR'd display filter (one clause
+    per packet selector). A single filter that long can exceed the host OS's
+    command-line length limit when handed to TShark as a subprocess argument
+    (WinError 206 on Windows). This splits the selectors into batches so each
+    resulting filter string stays under max_length, while still covering
+    every selector across the returned batches.
+    """
+    if not case.selectors:
+        raise ValueError(f"{case.case_id} has no usable packet selectors")
+
+    clauses = [
+        f"({_selector_filter(selector, padding_seconds)})"
+        for selector in case.selectors
+    ]
+
+    batches: list[str] = []
+    current: list[str] = []
+    current_length = 0
+
+    for clause in clauses:
+        # +4 approximates the " || " joiner that will sit between clauses.
+        added_length = len(clause) + (4 if current else 0)
+        if current and current_length + added_length > max_length:
+            batches.append(" || ".join(current))
+            current = []
+            current_length = 0
+            added_length = len(clause)
+
+        current.append(clause)
+        current_length += added_length
+
+    if current:
+        batches.append(" || ".join(current))
+
+    return batches
 
 
 def find_tshark(explicit_path: str | None) -> str:
@@ -450,7 +639,7 @@ def collect_pcaps(pcap_paths: Iterable[Path], pcap_dirs: Iterable[Path]) -> list
 
 
 def candidate_pcaps_for_case(case: Case, pcaps: Sequence[Path]) -> list[Path]:
-    """Prefer a capture whose filename contains the case's UTC date."""
+    """Prefer captures whose filename contains the case's UTC date."""
     case_date = case.first_seen.astimezone(timezone.utc).date().isoformat()
     dated = [path for path in pcaps if case_date in path.name]
     return dated or list(pcaps)
@@ -557,11 +746,28 @@ def extract_packet_metadata(
     return parse_tshark_output(completed.stdout)
 
 
-def packet_direction(case: Case, packet: PacketEvidence) -> str | None:
-    if packet.src_ip == case.src_ip and packet.dest_ip == case.dest_ip:
+def _packet_matches_selector(packet: PacketEvidence, selector: FlowSelector) -> str | None:
+    if packet.src_ip == selector.src_ip and packet.dest_ip == selector.dest_ip:
+        if selector.src_port is not None and packet.src_port != selector.src_port:
+            return None
+        if selector.dest_port is not None and packet.dest_port != selector.dest_port:
+            return None
         return "source_to_destination"
-    if packet.src_ip == case.dest_ip and packet.dest_ip == case.src_ip:
+
+    if packet.src_ip == selector.dest_ip and packet.dest_ip == selector.src_ip:
+        if selector.dest_port is not None and packet.src_port != selector.dest_port:
+            return None
+        if selector.src_port is not None and packet.dest_port != selector.src_port:
+            return None
         return "destination_to_source"
+    return None
+
+
+def packet_direction(case: Case, packet: PacketEvidence) -> str | None:
+    for selector in case.selectors:
+        direction = _packet_matches_selector(packet, selector)
+        if direction:
+            return direction
     return None
 
 
@@ -657,15 +863,30 @@ def process_cases(
     for index, case in enumerate(cases, start=1):
         print(
             f"[{index}/{len(cases)}] {case.case_id}: "
-            f"{case.src_ip} -> {case.dest_ip}:{case.dest_port} "
-            f"({case.protocol or 'unknown'}, {len(case.flow_ids)} flows)"
+            f"{len(case.finding_ids)} findings, {len(case.flow_ids)} flows, "
+            f"{len(case.event_ids)} EVE events, {len(case.selectors)} packet selectors"
         )
-        display_filter = build_display_filter(case, padding_seconds)
+        display_filter_batches = build_display_filter_batches(
+            case, padding_seconds
+        )
+        if len(display_filter_batches) > 1:
+            print(
+                f"  filter split into {len(display_filter_batches)} batches "
+                "(too many selectors for a single TShark command line)"
+            )
         case_matches = 0
         case_new_rows = 0
 
         for pcap in candidate_pcaps_for_case(case, pcaps):
-            packets = extract_packet_metadata(tshark, pcap, display_filter)
+            packets_by_frame: dict[int, PacketEvidence] = {}
+            for display_filter in display_filter_batches:
+                for packet in extract_packet_metadata(
+                    tshark, pcap, display_filter
+                ):
+                    packets_by_frame[packet.packet_number] = packet
+            packets = sorted(
+                packets_by_frame.values(), key=lambda p: p.packet_number
+            )
             if not packets:
                 continue
 
@@ -678,14 +899,22 @@ def process_cases(
             )
 
             if export_directory is not None:
-                exported = export_case_capture(
-                    tshark,
-                    pcap,
-                    display_filter,
-                    case.case_id,
-                    export_directory,
-                )
-                print(f"  exported: {exported}")
+                for batch_index, display_filter in enumerate(
+                    display_filter_batches, start=1
+                ):
+                    suffix = (
+                        case.case_id
+                        if len(display_filter_batches) == 1
+                        else f"{case.case_id}-part{batch_index}"
+                    )
+                    exported = export_case_capture(
+                        tshark,
+                        pcap,
+                        display_filter,
+                        suffix,
+                        export_directory,
+                    )
+                    print(f"  exported: {exported}")
 
         if case_matches == 0:
             print("  no matching packets found")
@@ -699,14 +928,14 @@ def process_cases(
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Connect correlated SQLite cases to packet-level PCAP evidence using TShark."
+            "Connect current MITS SQLite cases to packet-level PCAP evidence using TShark."
         )
     )
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path("mits.db"),
-        help="shared SQLite database (default: mits.db)",
+        default=Path("database") / "mits_test.db",
+        help="shared SQLite database (default: database/mits_test.db)",
     )
     parser.add_argument(
         "--pcap",
@@ -742,7 +971,7 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PADDING_SECONDS,
         help=(
-            "seconds added before/after each case window "
+            "seconds added before/after supporting event windows "
             f"(default: {DEFAULT_PADDING_SECONDS})"
         ),
     )
@@ -795,20 +1024,13 @@ def main() -> int:
             ensure_evidence_tables(connection)
 
             linked_events = populate_case_event_links(connection)
-            if table_exists(connection, "events"):
-                total_case_event_links = connection.execute(
-                    "SELECT COUNT(*) FROM case_eve_events"
-                ).fetchone()[0]
-                print(
-                    f"Case -> EVE links: {total_case_event_links:,} total "
-                    f"({linked_events:,} new)"
-                )
-            else:
-                print(
-                    "events table not present yet; PCAP evidence will still be "
-                    "linked to cases. Once ingestion uses this same SQLite DB, "
-                    "case -> EVE links will be created automatically."
-                )
+            total_case_event_links = connection.execute(
+                "SELECT COUNT(*) FROM case_eve_events"
+            ).fetchone()[0]
+            print(
+                f"Case -> EVE links: {total_case_event_links:,} total "
+                f"({linked_events:,} new)"
+            )
 
             cases = load_cases(
                 connection,
@@ -816,13 +1038,24 @@ def main() -> int:
                 limit=arguments.limit,
             )
             if not cases:
-                print("No matching cases found")
+                print("No matching cases with usable packet evidence references found")
                 return 0
 
             print(f"Cases selected: {len(cases):,}")
             if arguments.show_filter:
                 for case in cases:
-                    print(f"{case.case_id}: {build_display_filter(case, arguments.time_padding)}")
+                    batches = build_display_filter_batches(
+                        case, arguments.time_padding
+                    )
+                    if len(batches) == 1:
+                        print(f"{case.case_id}: {batches[0]}")
+                    else:
+                        print(
+                            f"{case.case_id} "
+                            f"({len(batches)} filter batches):"
+                        )
+                        for index, batch in enumerate(batches, start=1):
+                            print(f"  part {index}: {batch}")
                 print()
 
             matches, new_rows = process_cases(

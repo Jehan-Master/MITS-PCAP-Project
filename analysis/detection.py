@@ -27,14 +27,14 @@ INTERNAL_NETWORKS = [
     ipaddress.ip_network("192.168.0.0/24"),
 ]
 
-def get_connection():
-    """Create a connection to the project SQLite database."""
-    return sqlite3.connect(DATABASE_PATH)
+def get_connection(database_path=DATABASE_PATH):
+    """Create a connection to the selected project SQLite database."""
+    return sqlite3.connect(database_path)
 
 
-def load_events():
-    """Load relevant event data from the SQLite database."""
-    connection = get_connection()
+def load_events(database_path=DATABASE_PATH):
+    """Load relevant event data from the selected SQLite database."""
+    connection = get_connection(database_path)
 
     try:
         events = pd.read_sql_query(
