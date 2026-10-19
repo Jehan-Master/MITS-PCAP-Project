@@ -1,0 +1,34 @@
+# Start the dashboard:   docker compose up --build
+# Ingest eve.json files: put them in input/, then
+#                        docker compose run --rm ingest /input/eve.json
+# PCAP evidence:         put .pcap/.pcapng files in pcap/, then
+#                        docker compose run --rm pcap-evidence
+# Stop everything:       docker compose down
+
+services:
+  dashboard:
+    build: ./Dashboard
+    ports:
+      - "8501:8501"            # <port on your PC>:<port in the container>
+    volumes:
+      - ./database:/data       # shared SQLite folder (same one ingest writes to)
+    environment:
+      MITS_DB_PATH: /data/mits.db   # where the dashboard should open the database
+    restart: unless-stopped
+
+  ingest:
+    build: ./DataInitialFiltering
+    volumes:
+      - ./input:/input:ro      # eve.json files from your PC, read-only
+      - ./database:/data       # writes mits.db here -> appears in database/ on your PC
+    profiles: ["tools"]        # not started by `docker compose up`, only by `docker compose run ingest`
+
+  # Needs Oleh's PCAPEvidence code (OlehBranch) merged first, otherwise the build fails
+  # because pcap_evidence.py is missing. Its own profile keeps it out of the other builds.
+  pcap-evidence:
+    build: ./PCAPEvidence
+    volumes:
+      - ./pcap:/pcap:ro        # PCAP files from your PC, read-only
+      - ./database:/data       # reads cases from and writes evidence to the shared mits.db
+      - ./evidence:/evidence   # optional per-case PCAPNG exports (add --export-dir /evidence)
+    profiles: ["pcap"]

@@ -1,0 +1,17 @@
+# Local virtual environment: Windows-only and huge, the image installs its own packages
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Never bake data or secrets into the image
+*.db
+*.sqlite
+*.sqlite3
+.env
+
+# Docker files themselves aren't needed inside the image
+Dockerfile
+.dockerignore

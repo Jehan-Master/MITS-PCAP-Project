@@ -235,6 +235,12 @@ $RECYCLE.BIN/
 # MITS project data
 input/
 database/
+pcap/
+evidence/
+
+# Packet capture files
+*.pcap
+*.pcapng
 
 # SQLite database files
 *.db
