@@ -13,6 +13,22 @@ The goal is to make large volumes of honeynet data easier to understand, filter,
 
 ## Getting Started
 
+### Quick start (Docker)
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and start it (wait until it reports that the engine is running).
+2. Open a terminal in the repository root.
+3. Start the app:
+   ```
+   docker compose up --build
+   ```
+4. Open the dashboard at http://localhost:8501.
+5. Stop the app (press `Ctrl+C` first if it is running in the terminal):
+   ```
+   docker compose down
+   ```
+
+Keep `--build` so your latest code changes are included. The database lives in the `database/` folder on your machine, so it is kept after `docker compose down`. More details are in [Executing program](#executing-program).
+
 ### Dependencies
 
 Before running the program, ensure you have:
@@ -34,6 +50,9 @@ The recommended way to run the prototype is with Docker. With Docker, Python and
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 2. Clone the repository:
+   ```
+   git clone https://github.com/Jehan-Master/MITS-PCAP-Project.git
+   ```
 3. Start Docker Desktop before running any of the commands below.
 
 The project uses these folders in the repository root for data. They are created automatically on first use, mounted into the containers, and ignored by git, so large datasets and the database never end up in an image or a commit:
