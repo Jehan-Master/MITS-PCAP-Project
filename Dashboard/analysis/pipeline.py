@@ -24,6 +24,7 @@ from analysis.detection import (
     build_protocol_anomaly_findings,
     detect_repeated_failed_authentication,
     load_events,
+    load_events_light,
 )
 from analysis.ingest import ingest_file, open_database, print_summary
 from AnomalyDetection.anomaly_detection import run_analysis as run_anomaly_analysis
@@ -256,15 +257,47 @@ def run_session_correlation(connection):
 
 def run_detection(database_path):
     """Run all currently implemented rule-based detection rules."""
-    events = load_events(database_path)
+    import time
+    import gc
 
-    r01 = build_high_connection_findings(events)
-    r02 = build_multi_port_findings(events)
+    # R01/R02 never read "raw" (the full per-event Suricata JSON, which at
+    # millions of rows is gigabytes of text). Loading a column-restricted
+    # version for them -- and freeing it before loading the full version
+    # R03/R04 need -- keeps peak memory from ever holding both the light
+    # and full DataFrames at once. On a machine with limited RAM headroom,
+    # that extra footprint was enough to push the process into disk
+    # paging/swapping, which looks like a hang rather than a crash: alive,
+    # using memory, but making almost no real progress.
+    t0 = time.perf_counter()
+    light_events = load_events_light(database_path)
+    print(f"  load_events_light (read {len(light_events):,} rows, no 'raw'): {time.perf_counter()-t0:7.2f}s")
+
+    t0 = time.perf_counter()
+    r01 = build_high_connection_findings(light_events)
+    print(f"  R01 High Connection Rate:   {time.perf_counter()-t0:7.2f}s -> {len(r01):,} findings")
+
+    t0 = time.perf_counter()
+    r02 = build_multi_port_findings(light_events)
+    print(f"  R02 Multi-Port Activity:    {time.perf_counter()-t0:7.2f}s -> {len(r02):,} findings")
+
+    del light_events
+    gc.collect()
+
+    t0 = time.perf_counter()
+    events = load_events(database_path)
+    print(f"  load_events (read {len(events):,} rows from SQLite, with 'raw'): {time.perf_counter()-t0:7.2f}s")
+
+    t0 = time.perf_counter()
     r03 = detect_repeated_failed_authentication(events)
+    print(f"  R03 Repeated Failed Auth:   {time.perf_counter()-t0:7.2f}s -> {len(r03):,} findings")
+
+    t0 = time.perf_counter()
     r04 = build_protocol_anomaly_findings(events)
+    print(f"  R04 Protocol Anomaly:       {time.perf_counter()-t0:7.2f}s -> {len(r04):,} findings")
 
     findings = r01 + r02 + r03 + r04
     findings.sort(key=lambda finding: finding["timestamp"])
+    print(f"  Total findings before case-building: {len(findings):,}")
 
     return events, findings
 
@@ -332,21 +365,32 @@ def run_pipeline(
             "Run ingestion first or provide an existing database."
         )
 
+    import time
+
     with sqlite3.connect(database_path) as connection:
+        t_stage = time.perf_counter()
         sessions = run_session_correlation(connection)
+        print(f"Session correlation: {time.perf_counter()-t_stage:7.2f}s")
+
+        print("Running rule-based detection...")
+        t_stage = time.perf_counter()
         events, findings = run_detection(database_path)
+        print(f"Detection total:     {time.perf_counter()-t_stage:7.2f}s")
 
         findings = normalize_findings(findings)
-        
+
         create_result_tables(connection)
-        
+
         save_findings(
             connection,
             findings,
         )
-        
+
+        print("Building cases from findings...")
+        t_stage = time.perf_counter()
         cases = build_candidate_cases(findings)
-        
+        print(f"Case-building:       {time.perf_counter()-t_stage:7.2f}s -> {len(cases):,} cases")
+
         save_cases(
             connection,
             cases,
@@ -356,12 +400,15 @@ def run_pipeline(
 
     anomaly_result = None
     if with_anomaly:
+        print("Running anomaly detection...")
+        t_stage = time.perf_counter()
         anomaly_result = run_anomaly_analysis(
             database_path,
             window_seconds=anomaly_window_seconds,
             threshold=anomaly_threshold,
             min_source_windows=anomaly_min_source_windows,
         )
+        print(f"Anomaly detection:   {time.perf_counter()-t_stage:7.2f}s")
 
     return {
         "event_count": len(events),
