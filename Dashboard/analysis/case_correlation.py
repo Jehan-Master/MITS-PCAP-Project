@@ -2,7 +2,7 @@ from itertools import combinations
 
 import pandas as pd
 
-from analysis.detection import (
+from Dashboard.analysis.detection import (
     build_high_connection_findings,
     build_multi_port_findings,
     detect_repeated_failed_authentication,
@@ -160,21 +160,22 @@ def compare_findings(finding_a, finding_b):
 def build_candidate_cases(findings):
     """
     Group correlated findings into candidate cases.
-
-    Findings are expected to already contain a finding_id.
-    The pipeline assigns these IDs once before correlation.
     """
 
+    finding_count = len(findings)
+
+    # Assign stable IDs
     finding_records = []
 
-    for finding in findings:
+    for index, finding in enumerate(
+        findings,
+        start=1,
+    ):
         record = finding.copy()
-
-        if "finding_id" not in record:
-            raise ValueError(
-                "Finding is missing required finding_id."
-            )
-
+        record["finding_id"] = get_finding_id(
+            finding,
+            index,
+        )
         finding_records.append(record)
 
     # Build a graph of correlated findings
@@ -758,7 +759,7 @@ if __name__ == "__main__":
             f"{case['correlation_strength']} | "
             f"{case['source_ips']}"
         )
-
+        
     # --------------------------------------------------------
     # Print candidate cases
     # --------------------------------------------------------

@@ -10,26 +10,27 @@ import json
 import sqlite3
 from pathlib import Path
 
-from analysis.case_correlation import build_candidate_cases, get_finding_id
-from analysis.correlation import (
+from Dashboard.analysis.case_correlation import build_candidate_cases, get_finding_id
+from Dashboard.analysis.correlation import (
     build_sessions,
     create_sessions,
     group_flows,
     load_flows,
     save_sessions,
 )
-from analysis.detection import (
+from Dashboard.analysis.detection import (
     build_high_connection_findings,
     build_multi_port_findings,
     build_protocol_anomaly_findings,
     detect_repeated_failed_authentication,
     load_events,
+    load_events_light,
 )
-from analysis.ingest import ingest_file, open_database, print_summary
+from Dashboard.analysis.ingest import ingest_file, open_database, print_summary
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATABASE_FILE = PROJECT_ROOT / "database" / "mits_test.db"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DATABASE_FILE = REPOSITORY_ROOT / "database" / "mits.db"
 
 
 FINDINGS_SCHEMA = """
@@ -253,25 +254,68 @@ def run_session_correlation(connection):
     return sessions
 
 
-def run_detection():
+def run_detection(database_path):
     """Run all currently implemented rule-based detection rules."""
-    events = load_events()
+    import time
+    import gc
 
-    r01 = build_high_connection_findings(events)
-    r02 = build_multi_port_findings(events)
+    # R01/R02 never read "raw" (the full per-event Suricata JSON, which at
+    # millions of rows is gigabytes of text). Loading a column-restricted
+    # version for them -- and freeing it before loading the full version
+    # R03/R04 need -- keeps peak memory from ever holding both the light
+    # and full DataFrames at once. On a machine with limited RAM headroom,
+    # that extra footprint was enough to push the process into disk
+    # paging/swapping, which looks like a hang rather than a crash: alive,
+    # using memory, but making almost no real progress.
+    t0 = time.perf_counter()
+    light_events = load_events_light(database_path)
+    print(f"  load_events_light (read {len(light_events):,} rows, no 'raw'): {time.perf_counter()-t0:7.2f}s")
+
+    t0 = time.perf_counter()
+    r01 = build_high_connection_findings(light_events)
+    print(f"  R01 High Connection Rate:   {time.perf_counter()-t0:7.2f}s -> {len(r01):,} findings")
+
+    t0 = time.perf_counter()
+    r02 = build_multi_port_findings(light_events)
+    print(f"  R02 Multi-Port Activity:    {time.perf_counter()-t0:7.2f}s -> {len(r02):,} findings")
+
+    del light_events
+    gc.collect()
+
+    t0 = time.perf_counter()
+    events = load_events(database_path)
+    print(f"  load_events (read {len(events):,} rows from SQLite, with 'raw'): {time.perf_counter()-t0:7.2f}s")
+
+    t0 = time.perf_counter()
     r03 = detect_repeated_failed_authentication(events)
+    print(f"  R03 Repeated Failed Auth:   {time.perf_counter()-t0:7.2f}s -> {len(r03):,} findings")
+
+    t0 = time.perf_counter()
     r04 = build_protocol_anomaly_findings(events)
+    print(f"  R04 Protocol Anomaly:       {time.perf_counter()-t0:7.2f}s -> {len(r04):,} findings")
 
     findings = r01 + r02 + r03 + r04
     findings.sort(key=lambda finding: finding["timestamp"])
+    print(f"  Total findings before case-building: {len(findings):,}")
 
     return events, findings
 
 
-def run_pipeline(database_path=DATABASE_FILE, input_files=None):
+def run_pipeline(
+    database_path=DATABASE_FILE,
+    input_files=None,
+    with_anomaly=False,
+    anomaly_window_seconds=60,
+    anomaly_threshold=3.5,
+    anomaly_min_source_windows=5,
+):
     """Run ingestion (when requested), correlation, detection and case creation.
 
     Returns a dictionary containing the in-memory results from the run.
+
+    Statistical anomaly detection is optional because it is a separate detector
+    from the existing rule-based detection pipeline. When enabled, it reads the
+    same shared SQLite events table and stores its own derived anomaly tables.
     """
     database_path = Path(database_path)
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,36 +364,50 @@ def run_pipeline(database_path=DATABASE_FILE, input_files=None):
             "Run ingestion first or provide an existing database."
         )
 
-    # The current detection module reads the project's configured database
-    # path directly. Keep the pipeline explicit about that constraint rather
-    # than silently analysing a different database.
-    if database_path.resolve() != DATABASE_FILE.resolve():
-        raise ValueError(
-            "The current detection module uses database/mits_test.db "
-            "directly. Run the pipeline with the project's default database."
-        )
+    import time
 
     with sqlite3.connect(database_path) as connection:
+        t_stage = time.perf_counter()
         sessions = run_session_correlation(connection)
-        events, findings = run_detection()
+        print(f"Session correlation: {time.perf_counter()-t_stage:7.2f}s")
+
+        print("Running rule-based detection...")
+        t_stage = time.perf_counter()
+        events, findings = run_detection(database_path)
+        print(f"Detection total:     {time.perf_counter()-t_stage:7.2f}s")
 
         findings = normalize_findings(findings)
-        
+
         create_result_tables(connection)
-        
+
         save_findings(
             connection,
             findings,
         )
-        
+
+        print("Building cases from findings...")
+        t_stage = time.perf_counter()
         cases = build_candidate_cases(findings)
-        
+        print(f"Case-building:       {time.perf_counter()-t_stage:7.2f}s -> {len(cases):,} cases")
+
         save_cases(
             connection,
             cases,
         )
 
         connection.commit()
+
+    anomaly_result = None
+    if with_anomaly:
+        print("Running anomaly detection...")
+        t_stage = time.perf_counter()
+        anomaly_result = run_anomaly_analysis(
+            database_path,
+            window_seconds=anomaly_window_seconds,
+            threshold=anomaly_threshold,
+            min_source_windows=anomaly_min_source_windows,
+        )
+        print(f"Anomaly detection:   {time.perf_counter()-t_stage:7.2f}s")
 
     return {
         "event_count": len(events),
@@ -358,6 +416,7 @@ def run_pipeline(database_path=DATABASE_FILE, input_files=None):
         "case_count": len(cases),
         "findings": findings,
         "cases": cases,
+        "anomaly_result": anomaly_result,
     }
 
 
@@ -377,6 +436,29 @@ def parse_arguments():
         default=DATABASE_FILE,
         help="path to the project SQLite database",
     )
+    parser.add_argument(
+        "--with-anomaly",
+        action="store_true",
+        help="run statistical anomaly detection after case generation",
+    )
+    parser.add_argument(
+        "--anomaly-window-seconds",
+        type=int,
+        default=60,
+        help="time-window size used by anomaly detection (default: 60)",
+    )
+    parser.add_argument(
+        "--anomaly-threshold",
+        type=float,
+        default=3.5,
+        help="modified z-score threshold used by anomaly detection (default: 3.5)",
+    )
+    parser.add_argument(
+        "--anomaly-min-source-windows",
+        type=int,
+        default=5,
+        help="minimum source windows required for a source baseline (default: 5)",
+    )
     return parser.parse_args()
 
 
@@ -392,6 +474,10 @@ def main():
         results = run_pipeline(
             database_path=arguments.db,
             input_files=arguments.inputs or None,
+            with_anomaly=arguments.with_anomaly,
+            anomaly_window_seconds=arguments.anomaly_window_seconds,
+            anomaly_threshold=arguments.anomaly_threshold,
+            anomaly_min_source_windows=arguments.anomaly_min_source_windows,
         )
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"Pipeline failed: {error}")
@@ -404,6 +490,14 @@ def main():
     print(f"Sessions:  {results['session_count']:,}")
     print(f"Findings:  {results['finding_count']:,}")
     print(f"Cases:     {results['case_count']:,}")
+
+    anomaly_result = results.get("anomaly_result")
+    if anomaly_result is not None:
+        print(f"Anomaly windows:  {anomaly_result.windows_created:,}")
+        print(f"Anomaly baselines:{anomaly_result.baselines_created:,}")
+        print(f"Anomaly findings: {anomaly_result.findings_created:,}")
+        print(f"Anomaly links:    {anomaly_result.event_links_created:,}")
+
     print("Analysis results saved to SQLite.")
     return 0
 
