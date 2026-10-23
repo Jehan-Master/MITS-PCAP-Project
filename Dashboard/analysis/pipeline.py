@@ -10,15 +10,15 @@ import json
 import sqlite3
 from pathlib import Path
 
-from analysis.case_correlation import build_candidate_cases, get_finding_id
-from analysis.correlation import (
+from Dashboard.analysis.case_correlation import build_candidate_cases, get_finding_id
+from Dashboard.analysis.correlation import (
     build_sessions,
     create_sessions,
     group_flows,
     load_flows,
     save_sessions,
 )
-from analysis.detection import (
+from Dashboard.analysis.detection import (
     build_high_connection_findings,
     build_multi_port_findings,
     build_protocol_anomaly_findings,
@@ -26,8 +26,7 @@ from analysis.detection import (
     load_events,
     load_events_light,
 )
-from analysis.ingest import ingest_file, open_database, print_summary
-from AnomalyDetection.anomaly_detection import run_analysis as run_anomaly_analysis
+from Dashboard.analysis.ingest import ingest_file, open_database, print_summary
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]

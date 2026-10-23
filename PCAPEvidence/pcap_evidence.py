@@ -591,6 +591,50 @@ def build_display_filter_batches(
     return batches
 
 
+def build_combined_display_filter_batches(
+    case_selector_pairs: Sequence[tuple["Case", "FlowSelector"]],
+    padding_seconds: float,
+    max_length: int = MAX_DISPLAY_FILTER_LENGTH,
+) -> list[str]:
+    """Like build_display_filter_batches, but over selectors drawn from
+    MANY cases at once rather than a single case's own selectors.
+
+    This is what lets process_cases invoke TShark once per PCAP file
+    (across however many cases map to it) instead of once per case: with
+    many cases sharing the same file, the old per-case approach meant
+    TShark re-read and re-parsed the entire file from scratch for every
+    single case -- fine at a couple dozen cases, but a 1,000+-case run
+    multiplies that full-file cost by 1,000+, dominated by repeated I/O and
+    TShark startup rather than anything about the filtering itself.
+    Batching is still needed here for the same command-line-length reason
+    as before; it just now spans selectors from multiple cases per batch.
+    """
+    clauses = [
+        f"({_selector_filter(selector, padding_seconds)})"
+        for _case, selector in case_selector_pairs
+    ]
+
+    batches: list[str] = []
+    current: list[str] = []
+    current_length = 0
+
+    for clause in clauses:
+        added_length = len(clause) + (4 if current else 0)
+        if current and current_length + added_length > max_length:
+            batches.append(" || ".join(current))
+            current = []
+            current_length = 0
+            added_length = len(clause)
+
+        current.append(clause)
+        current_length += added_length
+
+    if current:
+        batches.append(" || ".join(current))
+
+    return batches
+
+
 def find_tshark(explicit_path: str | None) -> str:
     if explicit_path:
         candidate = Path(explicit_path)
@@ -771,6 +815,35 @@ def packet_direction(case: Case, packet: PacketEvidence) -> str | None:
     return None
 
 
+def _packet_matches_case_with_time(
+    case: Case, packet: PacketEvidence, padding_seconds: float
+) -> str | None:
+    """Like packet_direction, but also requires the packet's own timestamp
+    to fall within the (padded) time window of the specific selector it
+    matched on endpoints -- not just an endpoint match.
+
+    _packet_matches_selector/packet_direction only check IP/port, because
+    originally a packet reaching that check had *already* been filtered by
+    TShark's own per-case display filter, which includes a
+    `frame.time_epoch >= ... && <= ...` clause per selector -- so a time
+    check there would have been redundant. Once TShark runs once per PCAP
+    file across many cases combined (process_cases) instead of once per
+    case, a packet reaching this point may have matched a *different*
+    case's selector's time window rather than this one's, so the time
+    check that used to be implicit (done by TShark, per case) has to be
+    made explicit here, per case, during the post-processing split.
+    """
+    for selector in case.selectors:
+        direction = _packet_matches_selector(packet, selector)
+        if not direction:
+            continue
+        window_start = selector.first_seen.timestamp() - padding_seconds
+        window_end = selector.last_seen.timestamp() + padding_seconds
+        if window_start <= packet.packet_epoch <= window_end:
+            return direction
+    return None
+
+
 def save_packet_evidence(
     connection: sqlite3.Connection,
     case: Case,
@@ -857,54 +930,96 @@ def process_cases(
     padding_seconds: float,
     export_directory: Path | None,
 ) -> tuple[int, int]:
+    """Match every case's selectors against the PCAP file(s) that cover it.
+
+    TShark is invoked once per (PCAP file, filter batch) -- across however
+    many cases share that file -- rather than once per case. The original
+    ran a full TShark pass (reading the whole file from scratch) for every
+    single case; with many cases mapping to the same handful of PCAP
+    files, that repeated the same full-file read and parse over and over.
+    Matching results are still attributed and printed per case exactly as
+    before -- this only changes how many times TShark itself runs, not
+    which packets end up linked to which case.
+    """
     total_matches = 0
     total_new_rows = 0
 
-    for index, case in enumerate(cases, start=1):
-        print(
-            f"[{index}/{len(cases)}] {case.case_id}: "
-            f"{len(case.finding_ids)} findings, {len(case.flow_ids)} flows, "
-            f"{len(case.event_ids)} EVE events, {len(case.selectors)} packet selectors"
-        )
-        display_filter_batches = build_display_filter_batches(
-            case, padding_seconds
-        )
-        if len(display_filter_batches) > 1:
-            print(
-                f"  filter split into {len(display_filter_batches)} batches "
-                "(too many selectors for a single TShark command line)"
-            )
-        case_matches = 0
-        case_new_rows = 0
-
+    # Group cases by the PCAP file(s) they map to, so each physical file is
+    # read by TShark once per batch across ALL its cases combined.
+    cases_by_pcap: dict[Path, list[Case]] = {}
+    for case in cases:
         for pcap in candidate_pcaps_for_case(case, pcaps):
-            packets_by_frame: dict[int, PacketEvidence] = {}
-            for display_filter in display_filter_batches:
-                for packet in extract_packet_metadata(
-                    tshark, pcap, display_filter
+            cases_by_pcap.setdefault(pcap, []).append(case)
+
+    # Per (case_id, pcap) results, so the original per-case/per-pcap
+    # reporting lines can be reproduced exactly once everything's matched.
+    matches_by_case_pcap: dict[tuple[str, Path], int] = {}
+    new_rows_by_case_pcap: dict[tuple[str, Path], int] = {}
+    batches_used_by_case: dict[str, int] = {}
+
+    for pcap, pcap_cases in cases_by_pcap.items():
+        pairs = [
+            (case, selector)
+            for case in pcap_cases
+            for selector in case.selectors
+        ]
+        display_filter_batches = build_combined_display_filter_batches(
+            pairs, padding_seconds
+        )
+
+        for case in pcap_cases:
+            # A case's own batch count, for the "filter split into N
+            # batches" line -- computed the same way as before (per case),
+            # even though the actual TShark run below is now shared.
+            batches_used_by_case[case.case_id] = len(
+                build_display_filter_batches(case, padding_seconds)
+            )
+
+        packets_by_frame: dict[int, PacketEvidence] = {}
+        for display_filter in display_filter_batches:
+            for packet in extract_packet_metadata(tshark, pcap, display_filter):
+                packets_by_frame[packet.packet_number] = packet
+
+        if not packets_by_frame:
+            continue
+
+        packets = sorted(packets_by_frame.values(), key=lambda p: p.packet_number)
+
+        # Assign each matched packet to every case whose own selectors it
+        # satisfies (same _packet_matches_selector logic as before, just
+        # run against a shared pool of packets instead of a fresh TShark
+        # call per case).
+        packets_per_case: dict[str, list[PacketEvidence]] = {}
+        for packet in packets:
+            for case in pcap_cases:
+                if (
+                    _packet_matches_case_with_time(case, packet, padding_seconds)
+                    is not None
                 ):
-                    packets_by_frame[packet.packet_number] = packet
-            packets = sorted(
-                packets_by_frame.values(), key=lambda p: p.packet_number
-            )
-            if not packets:
-                continue
+                    packets_per_case.setdefault(case.case_id, []).append(packet)
 
-            case_matches += len(packets)
-            new_rows = save_packet_evidence(connection, case, pcap, packets)
-            case_new_rows += new_rows
-            print(
-                f"  {pcap.name}: {len(packets):,} matching packets, "
-                f"{new_rows:,} new evidence rows"
-            )
+        case_lookup = {case.case_id: case for case in pcap_cases}
+        for case_id, case_packets in packets_per_case.items():
+            case = case_lookup[case_id]
+            new_rows = save_packet_evidence(connection, case, pcap, case_packets)
+            matches_by_case_pcap[(case_id, pcap)] = len(case_packets)
+            new_rows_by_case_pcap[(case_id, pcap)] = new_rows
 
-            if export_directory is not None:
+        if export_directory is not None:
+            # Exports are still one TShark run per case (each case gets
+            # its own output file, so there's nothing to share across
+            # cases here) -- but only paid when --export-dir is actually
+            # requested, same as before.
+            for case in pcap_cases:
+                display_filter_batches_for_case = build_display_filter_batches(
+                    case, padding_seconds
+                )
                 for batch_index, display_filter in enumerate(
-                    display_filter_batches, start=1
+                    display_filter_batches_for_case, start=1
                 ):
                     suffix = (
                         case.case_id
-                        if len(display_filter_batches) == 1
+                        if len(display_filter_batches_for_case) == 1
                         else f"{case.case_id}-part{batch_index}"
                     )
                     exported = export_case_capture(
@@ -915,6 +1030,32 @@ def process_cases(
                         export_directory,
                     )
                     print(f"  exported: {exported}")
+
+    for index, case in enumerate(cases, start=1):
+        print(
+            f"[{index}/{len(cases)}] {case.case_id}: "
+            f"{len(case.finding_ids)} findings, {len(case.flow_ids)} flows, "
+            f"{len(case.event_ids)} EVE events, {len(case.selectors)} packet selectors"
+        )
+        if batches_used_by_case.get(case.case_id, 1) > 1:
+            print(
+                f"  filter split into {batches_used_by_case[case.case_id]} batches "
+                "(too many selectors for a single TShark command line)"
+            )
+
+        case_matches = 0
+        case_new_rows = 0
+        for pcap in candidate_pcaps_for_case(case, pcaps):
+            matches = matches_by_case_pcap.get((case.case_id, pcap), 0)
+            if matches == 0:
+                continue
+            new_rows = new_rows_by_case_pcap.get((case.case_id, pcap), 0)
+            case_matches += matches
+            case_new_rows += new_rows
+            print(
+                f"  {pcap.name}: {matches:,} matching packets, "
+                f"{new_rows:,} new evidence rows"
+            )
 
         if case_matches == 0:
             print("  no matching packets found")
