@@ -1,0 +1,4 @@
+*
+!Pipeline/requirements.txt
+!Dashboard/analysis/
+**/__pycache__

@@ -59,10 +59,25 @@ The project uses these folders in the repository root for data. They are created
 
 | Folder | Contents | Used by |
 |---|---|---|
-| `input/` | Suricata `eve.json` files | ingestion |
+| `input/` | Suricata `eve.json` files | ingestion, analysis pipeline |
 | `database/` | the shared SQLite database `mits.db` | all parts |
 | `pcap/` | `.pcap` / `.pcapng` files | PCAP evidence |
 | `evidence/` | optional per-case PCAPNG exports | PCAP evidence |
+
+### Docker setup
+
+| Service | Built from | What it does | How to run it |
+|---|---|---|---|
+| `dashboard` | `Dashboard/` | Streamlit dashboard on port 8501 | `docker compose up` |
+| `ingest` | `DataInitialFiltering/` | loads `eve.json` files into `mits.db` | `docker compose run --rm ingest` |
+| `pipeline` | repository root, `Pipeline/Dockerfile` | sessions, rule-based detection and candidate cases | `docker compose run --rm pipeline` |
+| `pcap-evidence` | `PCAPEvidence/` | links cases to packets with TShark | `docker compose run --rm pcap-evidence` |
+
+* `ingest`, `pipeline` and `pcap-evidence` process data and then stop. They are only run when you call them by name. In `docker-compose.yml` this is done with a profile: `tools` for `ingest` and `pipeline`, `pcap` for `pcap-evidence`. To build them, add the profile to the command, for example `docker compose --profile tools build`.
+* Every service uses the same `database/` folder, mounted as `/data` inside the containers, and opens `/data/mits.db`. The dashboard receives this path in the `MITS_DB_PATH` environment variable. Newly analysed data is visible in the dashboard without rebuilding.
+* `input/` and `pcap/` are set up to be read-only, so the containers cannot change the original data.
+* The `pipeline` image is built from the repository root because its code imports `Dashboard.analysis`. The `.dockerignore` in the root only lets `Dashboard/analysis/` and `Pipeline/requirements.txt` through, so the large `input/` and `database/` folders are never sent to Docker.
+* The `.dockerignore` files in the service folders keep virtual environments, cache files, databases and `.env` files out of the images.
 
 ### Executing program
 
@@ -76,7 +91,19 @@ docker compose run --rm ingest /input/eve.json
 ```
 Several files can be passed at once (`/input/day1.json /input/day2.json`). The database is written to `database/mits.db`. Running the same file again does not create duplicate rows.
 
-**2. Start the dashboard**
+**2. Run the analysis**
+
+Build the sessions, findings and candidate cases from the ingested events:
+```
+docker compose run --rm pipeline
+```
+The pipeline can also ingest files first, which combines steps 1 and 2 in one command:
+```
+docker compose run --rm pipeline /input/eve.json
+```
+It ends with a summary of the number of events, sessions, findings and cases. Running it again re-analyses the data that is already in the database.
+
+**3. Start the dashboard**
 ```
 docker compose up --build
 ```
@@ -85,7 +112,7 @@ Open http://localhost:8501 in a browser. Stop it with:
 docker compose down
 ```
 
-**3. Extract PCAP evidence**
+**4. Extract PCAP evidence**
 
 Copy capture files into `pcap/`, then run:
 ```
@@ -110,6 +137,7 @@ Once the PCAP evidence code is merged, use `docker compose --profile tools --pro
 Show the options of each command-line tool:
 ```
 docker compose run --rm ingest --help
+docker compose run --rm pipeline --help
 docker compose run --rm pcap-evidence --help
 ```
 
