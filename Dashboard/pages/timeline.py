@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-import json
 from datetime import timedelta
-from data.analysis_data import get_cases, get_case_findings
+from data.database import get_events
 
 # --------------------------------------------------
 # Page title
@@ -16,75 +15,50 @@ st.write(
     "analysis system."
 )
 
-
 # --------------------------------------------------
 # Prepare event data
 # --------------------------------------------------
 
-cases = get_cases()
+events_df = get_events()
 
-events = []
+if events_df.empty:
+    st.info("No network events are currently available.")
+    st.stop()
 
-for _, case in cases.iterrows():
-    case_findings = get_case_findings(case["case_id"])
+# Rename database columns for the dashboard.
+events_df = events_df.rename(
+    columns={
+        "id": "Event ID",
+        "ts": "Timestamp",
+        "event_type": "Event Type",
+        "src_ip": "Source IP",
+        "src_port": "Source Port",
+        "dest_ip": "Destination IP",
+        "dest_port": "Destination Port",
+        "proto": "Protocol",
+        "app_proto": "Application Protocol",
+        "alert_sid": "Alert SID",
+        "alert_signature": "Alert Signature",
+        "alert_severity": "Alert Severity",
+    }
+)
 
-    for _, finding in case_findings.iterrows():
-        details = finding["details"]
+# Parse mixed timestamp formats and normalize to UTC.
+events_df["Timestamp"] = pd.to_datetime(
+    events_df["Timestamp"],
+    format="mixed",
+    errors="coerce",
+    utc=True,
+)
 
-        if isinstance(details, str):
-            try:
-                details = json.loads(details)
-            except json.JSONDecodeError:
-                details = {}
+# Remove records with invalid timestamps.
+events_df = events_df.dropna(subset=["Timestamp"])
 
-        destination_ips = details.get(
-            "destination_ips",
-            []
-        )
+if events_df.empty:
+    st.info("No network events with valid timestamps are available.")
+    st.stop()
 
-        if isinstance(destination_ips, str):
-            destination_ips = [destination_ips]
-
-        events.append(
-            {
-                "Case ID": case["case_id"],
-                "Timestamp": finding["timestamp"],
-                "Event Type": finding["rule_name"],
-                "Source IP": finding["source_ip"]
-                or "N/A",
-                "Destination IP": ", ".join(
-                    str(ip)
-                    for ip in destination_ips
-                )
-                or "N/A",
-                "Destination Port": "N/A",
-                "Protocol": "N/A",
-                "Priority": finding["priority"]
-                or "N/A",
-                "Evidence": (
-                    ", ".join(
-                        str(event_id)
-                        for event_id in finding["event_ids"]
-                    )
-                    if finding["event_ids"]
-                    else "N/A"
-                ),
-            }
-        )
-
-        events_df = pd.DataFrame(events)
-
-        if events_df.empty:
-            st.info("No events are currently available.")
-            st.stop()
-
-        events_df["Timestamp"] = pd.to_datetime(
-            events_df["Timestamp"]
-        )
-
-        events_df = events_df.sort_values(
-            "Timestamp"
-        )
+events_df = events_df.sort_values("Timestamp")
 
 # --------------------------------------------------
 # Determine available time range
@@ -170,45 +144,29 @@ if filtered_events.empty:
     )
 
 else:
-    priority_order = [
-        "High",
-        "Medium",
-        "Low",
-        "Info"
-    ]
-
-    filtered_events = filtered_events.copy()
-
-    filtered_events["Priority"] = pd.Categorical(
-        filtered_events["Priority"],
-        categories=priority_order,
-        ordered=True
-    )
-
     fig = px.scatter(
         filtered_events,
         x="Timestamp",
-        y="Priority",
-        color="Priority",
-        category_orders={
-            "Priority": priority_order
-        },
+        y="Event Type",
+        color="Event Type",
         hover_data={
-            "Case ID": True,
+            "Event ID": True,
             "Event Type": True,
             "Source IP": True,
+            "Source Port": True,
             "Destination IP": True,
             "Destination Port": True,
             "Protocol": True,
+            "Application Protocol": True,
+            "Alert SID": True,
+            "Alert Signature": True,
+            "Alert Severity": True,
             "Timestamp": True,
-            "Priority": True
-        }
+        },
     )
 
     fig.update_traces(
-        marker=dict(
-            size=9
-        )
+        marker=dict(size=9)
     )
 
     fig.update_layout(
@@ -217,29 +175,28 @@ else:
             t=20,
             b=20,
             l=20,
-            r=20
+            r=20,
         ),
         xaxis_title=None,
         yaxis_title=None,
-        legend_title=None
+        legend_title=None,
     )
 
     st.plotly_chart(
         fig,
-        width="stretch"
+        width="stretch",
     )
-
 
 # --------------------------------------------------
 # Event table
 # --------------------------------------------------
 
-st.subheader("Events")
-
+st.subheader("Network Events")
 
 if filtered_events.empty:
     st.info(
-        "No events are available for the selected timeframe."
+        "No network events are available "
+        "for the selected timeframe."
     )
 
 else:
@@ -247,35 +204,37 @@ else:
 
     table_data["Timestamp"] = (
         table_data["Timestamp"]
-        .dt.strftime("%Y-%m-%d %H:%M:%S")
+        .dt.strftime("%Y-%m-%d %H:%M:%S UTC")
     )
 
-    table_data["Details"] = table_data.apply(
-        lambda row: (
-            f'{row["Event Type"]} — '
-            f'{row["Destination IP"]}:'
-            f'{row["Destination Port"]} '
-            f'({row["Protocol"]})'
-        ),
-        axis=1
-    )
+    # Build Details using available alert information.
+    #def format_event_details(row):
+    #    if pd.notna(row["Alert Signature"]):
+    #        return f'Alert: {row["Alert Signature"]}'
+
+    #    return ""
+
+    #table_data["Details"] = table_data.apply(
+    #    format_event_details,
+    #    axis=1,
+    #"""
 
     table_data = table_data[
         [
             "Timestamp",
             "Event Type",
             "Source IP",
-            "Details",
-            "Priority"
+            "Destination IP",
+            "Protocol",
+            #"Details",
         ]
     ]
 
     st.dataframe(
         table_data,
         width="stretch",
-        hide_index=True
+        hide_index=True,
     )
-
 
 # --------------------------------------------------
 # Prototype notice

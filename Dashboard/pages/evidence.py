@@ -234,36 +234,27 @@ if filter_option != "All":
 # Pagination
 # --------------------------------------------------
 
-rows_per_page = 5
-
+rows_per_page = 8
 total_rows = len(filtered_evidence)
 
-if total_rows > 0:
-    total_pages = (
-        (total_rows - 1) // rows_per_page
-    ) + 1
-else:
-    total_pages = 1
+total_pages = max(
+    1,
+    (total_rows + rows_per_page - 1) // rows_per_page,
+)
 
-if "evidence_page" not in st.session_state:
-    st.session_state["evidence_page"] = 1
+# Keep the current page valid when filters change.
+if "evidence_pagination" not in st.session_state:
+    st.session_state["evidence_pagination"] = 1
 
-current_page = st.session_state["evidence_page"]
+if st.session_state["evidence_pagination"] > total_pages:
+    st.session_state["evidence_pagination"] = total_pages
 
-if current_page > total_pages:
-    current_page = total_pages
-    st.session_state["evidence_page"] = current_page
+current_page = st.session_state["evidence_pagination"]
 
-start_index = (
-    current_page - 1
-) * rows_per_page
-
+start_index = (current_page - 1) * rows_per_page
 end_index = start_index + rows_per_page
 
-page_evidence = filtered_evidence.iloc[
-    start_index:end_index
-]
-
+page_evidence = filtered_evidence.iloc[start_index:end_index]
 
 # --------------------------------------------------
 # Evidence tabs
@@ -308,11 +299,17 @@ with eve_tab:
     else:
         eve_display_df = page_evidence.copy()
 
+        # Format timestamps for display.
         eve_display_df["Timestamp"] = (
-            eve_display_df["Timestamp"]
-            .dt.strftime("%Y-%m-%d %H:%M:%S")
+            pd.to_datetime(
+                eve_display_df["Timestamp"],
+                errors="coerce",
+                utc=True,
+            )
+            .dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         )
 
+        # Keep the table focused on the main event fields.
         eve_display_df = eve_display_df[
             [
                 "Timestamp",
@@ -322,16 +319,114 @@ with eve_tab:
                 "Destination IP",
                 "Destination Port",
                 "Protocol",
-                "Info"
+                "Info",
             ]
         ]
 
-        st.dataframe(
-            eve_display_df,
-            width="stretch",
-            hide_index=True
+        st.caption(
+            "Select an event row to inspect its available evidence."
         )
 
+        event_table = st.dataframe(
+            eve_display_df,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="evidence_event_table",
+        )
+
+        # Numbered pagination controls
+        if total_pages > 1:
+            st.pagination(
+                num_pages=total_pages,
+                key="evidence_pagination",
+                max_visible_pages=7,
+            )
+
+        # Event Details appears below pagination
+        selected_rows = event_table.selection.rows
+
+        if selected_rows:
+            selected_index = selected_rows[0]
+            selected_event = page_evidence.iloc[selected_index]
+
+        # --------------------------------------------------
+        # Selected event details
+        # --------------------------------------------------
+
+        selected_rows = event_table.selection.rows
+
+        if selected_rows:
+            selected_index = selected_rows[0]
+            selected_event = page_evidence.iloc[selected_index]
+
+            st.divider()
+            st.subheader("Event Details")
+
+            st.write(f"**Case ID:** {selected_event['Case ID']}")
+            st.write(f"**EVE ID:** {selected_event['EVE ID']}")
+
+            # Display only fields available for this event.
+            detail_fields = {
+                "Timestamp": "Timestamp",
+                "Event Type": "Info",
+                "Source IP": "Source IP",
+                "Source Port": "Source Port",
+                "Destination IP": "Destination IP",
+                "Destination Port": "Destination Port",
+                "Protocol": "Protocol",
+                "Source File": "source_file",
+                "Original Line Number": "line_no",
+                "Flow ID": "flow_id",
+                "Community ID": "community_id",
+                "Application Protocol": "app_proto",
+                "HTTP Method": "http_method",
+                "HTTP URL": "http_url",
+                "SSH Client Software": "ssh_client_software",
+                "Alert SID": "Alert SID",
+                "Alert Signature": "Alert Signature",
+                "Alert Severity": "Alert Severity",
+            }
+
+            available_details = []
+
+            for label, column in detail_fields.items():
+                if column not in selected_event.index:
+                    continue
+
+                value = selected_event[column]
+
+                if pd.isna(value) or value == "":
+                    continue
+
+                if label == "Timestamp":
+                    value = pd.to_datetime(
+                        value,
+                        errors="coerce",
+                        utc=True,
+                    )
+
+                    if pd.notna(value):
+                        value = value.strftime(
+                            "%Y-%m-%d %H:%M:%S UTC"
+                        )
+
+                available_details.append({
+                    "Field": label,
+                    "Value": str(value),
+                })
+
+            if available_details:
+                st.dataframe(
+                    pd.DataFrame(available_details),
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.info(
+                    "No additional event details are available."
+                )
 
 # --------------------------------------------------
 # Suricata Alerts tab
@@ -413,47 +508,6 @@ with suricata_tab:
                 width="stretch",
                 hide_index=True
             )
-
-# --------------------------------------------------
-# Pagination controls
-# --------------------------------------------------
-
-if total_rows > 0:
-
-    page_col1, page_col2, page_col3 = st.columns(
-        [1, 3, 1]
-    )
-
-    with page_col1:
-        if current_page > 1:
-            if st.button(
-                "‹",
-                key="previous_page"
-            ):
-                st.session_state["evidence_page"] -= 1
-                st.rerun()
-
-    with page_col2:
-        st.markdown(
-            f"""
-            <div style="
-                text-align: center;
-                padding-top: 0.4rem;
-            ">
-                Page {current_page} of {total_pages}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with page_col3:
-        if current_page < total_pages:
-            if st.button(
-                "›",
-                key="next_page"
-            ):
-                st.session_state["evidence_page"] += 1
-                st.rerun()
 
 # --------------------------------------------------
 # PCAP information

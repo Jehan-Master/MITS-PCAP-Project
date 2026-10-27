@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data.fake_cases import FAKE_CASES
 from data.database import get_events
 from analysis.detection import (
     load_events as load_detection_events,
@@ -34,37 +33,31 @@ st.write(
     "and detected suspicious behaviour."
 )
 
-
 # --------------------------------------------------
-# Prepare case and event data
+# Load real event data
 # --------------------------------------------------
 
-# Case data is still based on the prototype data.
-# Real case data will be connected once the
-# prioritization and case presentation are finalized.
+event_data_available = False
+event_load_error = None
 
-case_data = []
+try:
+    events = get_events()
 
-for case in FAKE_CASES:
+    if events is None:
+        events = pd.DataFrame()
 
-    case_data.append(
-        {
-            "ID": case.get("id", "N/A"),
-            "Type": case.get("type", "Unknown"),
-            "Source IP": case.get("source_ip", "N/A"),
-            "Priority": case.get("priority", "Unknown"),
-            "Status": case.get("status", "Unknown"),
-        }
-    )
+    event_data_available = True
 
+except Exception as error:
+    events = pd.DataFrame()
+    event_load_error = error
+    st.error(f"Database error: {type(error).__name__}: {error}")
 
-cases = pd.DataFrame(case_data)
-
-
-# Load real events from the SQLite database.
-
-events = get_events()
-
+# No fake cases are loaded.
+# Real case creation and prioritization are still pending.
+cases = pd.DataFrame(
+    columns=["ID", "Type", "Source IP", "Priority", "Status"]
+)
 
 # Rename database columns to match the dashboard naming.
 
@@ -81,62 +74,72 @@ events = events.rename(
     }
 )
 
+# Ensure the dashboard's expected columns exist.
+required_columns = [
+    "Timestamp",
+    "Event Type",
+    "Source IP",
+    "Source Port",
+    "Destination IP",
+    "Destination Port",
+    "Protocol",
+    "Application Protocol",
+]
 
-# Convert timestamps into datetime values.
+for column in required_columns:
+    if column not in events.columns:
+        events[column] = pd.NA
 
 events["Timestamp"] = pd.to_datetime(
     events["Timestamp"],
     errors="coerce",
 )
 
-
 # --------------------------------------------------
 # Run implemented rule-based detection
 # --------------------------------------------------
 
-# Detection currently operates directly on the
-# structured SQLite event data.
+suspicious_event_count = None
+detection_error = None
 
-detection_events = load_detection_events()
+try:
+    detection_events = load_detection_events()
 
-r01_findings = build_high_connection_findings(
-    detection_events
-)
-
-r02_findings = build_multi_port_findings(
-    detection_events
-)
-
-r03_findings = detect_repeated_failed_authentication(
-    detection_events
-)
-
-r04_findings = build_protocol_anomaly_findings(
-    detection_events
-)
-
-all_findings = (
-    r01_findings
-    + r02_findings
-    + r03_findings
-    + r04_findings
-)
-
-
-# Count unique underlying events identified by
-# the implemented rule-based detection methods.
-
-suspicious_event_ids = set()
-
-for finding in all_findings:
-    suspicious_event_ids.update(
-        finding.get("event_ids", [])
+    r01_findings = build_high_connection_findings(
+        detection_events
     )
 
-suspicious_event_count = len(
-    suspicious_event_ids
-)
+    r02_findings = build_multi_port_findings(
+        detection_events
+    )
 
+    r03_findings = detect_repeated_failed_authentication(
+        detection_events
+    )
+
+    r04_findings = build_protocol_anomaly_findings(
+        detection_events
+    )
+
+    all_findings = (
+        r01_findings
+        + r02_findings
+        + r03_findings
+        + r04_findings
+    )
+
+    suspicious_event_ids = set()
+
+    for finding in all_findings:
+        suspicious_event_ids.update(
+            finding.get("event_ids", [])
+        )
+
+    suspicious_event_count = len(suspicious_event_ids)
+
+except Exception as error:
+    detection_error = error
+    st.error(f"Detection error: {type(error).__name__}: {error}")
 
 # --------------------------------------------------
 # Event filters
@@ -253,7 +256,6 @@ if selected_destination_ip != "All":
         == selected_destination_ip
     ]
 
-
 # --------------------------------------------------
 # Overview metrics
 # --------------------------------------------------
@@ -262,52 +264,41 @@ st.subheader("Overview")
 
 col1, col2, col3, col4 = st.columns(4)
 
-
-# Total number of events
-
-total_events = len(events)
-
-
-# Number of events matching the current filters
-
-filtered_event_count = len(filtered_events)
-
-
 col1.metric(
     "Total Events",
-    total_events
+    f"{len(events):,}" if event_data_available else "Pending",
 )
-
-st.caption(
-    f"{filtered_event_count:,} events match "
-    "the current filters."
-)
-
-
-# Number of unique events identified by the
-# implemented rule-based detection methods.
 
 col2.metric(
     "Suspicious Events",
-    suspicious_event_count
+    (
+        f"{suspicious_event_count:,}"
+        if suspicious_event_count is not None
+        else "Pending"
+    ),
 )
-
-
-# Prioritization has not yet been implemented.
 
 col3.metric(
     "Prioritized Cases",
-    "Pending"
+    "Pending",
 )
-
-
-# MITRE ATT&CK mapping has not yet been implemented.
 
 col4.metric(
     "ATT&CK Mappings",
-    "Pending"
+    "Pending",
 )
 
+if not event_data_available:
+    st.warning(
+        "Real event data is unavailable. "
+        "Event counts and charts are Pending."
+    )
+
+if detection_error is not None:
+    st.warning(
+        "Detection results are Pending because "
+        "the detection module could not produce a result."
+    )
 
 # --------------------------------------------------
 # Event charts
@@ -430,72 +421,16 @@ with chart_col2:
             width="stretch"
         )
 
-
 # --------------------------------------------------
 # Top Investigated Cases
 # --------------------------------------------------
 
 st.subheader("Top Investigated Cases")
 
-
-if cases.empty:
-
-    st.info(
-        "No cases are currently available."
-    )
-
-else:
-
-    # Case prioritization has not yet been implemented,
-    # so the prototype case ordering is retained for now.
-
-    top_cases = cases.head(5)
-
-
-    # Table header
-
-    header_col1, header_col2, header_col3, header_col4, header_col5 = (
-        st.columns([1, 2, 2, 1, 1])
-    )
-
-    header_col1.write("**ID**")
-    header_col2.write("**Type**")
-    header_col3.write("**Source IP**")
-    header_col4.write("**Priority**")
-    header_col5.write("**Status**")
-
-    st.divider()
-
-
-    # Table rows
-
-    for _, case in top_cases.iterrows():
-
-        col1, col2, col3, col4, col5 = (
-            st.columns([1, 2, 2, 1, 1])
-        )
-
-        with col1:
-
-            if st.button(
-                case["ID"],
-                key=f"overview_case_{case['ID']}",
-                type="tertiary"
-            ):
-
-                st.session_state[
-                    "selected_case"
-                ] = case["ID"]
-
-                st.switch_page(
-                    "pages/case_detail.py"
-                )
-
-        col2.write(case["Type"])
-        col3.write(case["Source IP"])
-        col4.write(case["Priority"])
-        col5.write(case["Status"])
-
+st.info(
+    "Pending — real case creation, prioritization, "
+    "and case status are not yet connected."
+)
 
 # --------------------------------------------------
 # Footer

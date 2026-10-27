@@ -1,9 +1,12 @@
-import json
-
 import streamlit as st
 import pandas as pd
 
-from data.analysis_data import get_case, get_case_findings
+from data.analysis_data import (
+    get_case,
+    get_case_findings,
+    get_events_by_ids,
+    get_events_by_flow_ids,
+)
 
 
 # --------------------------------------------------
@@ -103,11 +106,30 @@ else:
 first_seen = case["first_seen"] or "N/A"
 last_seen = case["last_seen"] or "N/A"
 
-# The current analysis database stores detection findings
-# separately from the raw EVE events.
-# Therefore, the approved "Events" field is not populated
-# with a fabricated value.
-event_count = "Pending"
+
+# --------------------------------------------------
+# Calculate linked event information
+# --------------------------------------------------
+
+event_ids = {
+    event_id
+    for finding_event_ids in findings["event_ids"]
+    for event_id in finding_event_ids
+}
+
+flow_ids = {
+    flow_id
+    for finding_flow_ids in findings["flow_ids"]
+    for flow_id in finding_flow_ids
+}
+
+related_event_data = get_events_by_ids(sorted(event_ids))
+
+if related_event_data.empty and flow_ids:
+    related_event_data = get_events_by_flow_ids(sorted(flow_ids))
+
+event_count = len(related_event_data)
+
 
 
 # --------------------------------------------------
@@ -142,35 +164,52 @@ st.divider()
 
 st.subheader("Related Events")
 
-if not findings.empty:
+if not related_event_data.empty:
 
-    related_events = pd.DataFrame([
-    {
-        "Timestamp": finding["timestamp"],
-        "Event Type": finding["rule_name"],
-        "Destination": (
-            ", ".join(
-                json.loads(finding["details"]).get(
-                    "destination_ips", []
-                )
+    # Format timestamps for display without changing database values.
+    timestamps = (
+        pd.to_datetime(
+            related_event_data["ts"],
+            utc=True,
+            errors="coerce",
+        )
+        .dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        .fillna("N/A")
+    )
+
+    related_events = pd.DataFrame({
+        "Timestamp (UTC)": timestamps,
+        "Event Type": related_event_data["event_type"],
+        "Source IP": related_event_data["src_ip"].fillna("N/A"),
+        "Source Port": related_event_data["src_port"].apply(
+            lambda value: (
+                str(int(value))
+                if pd.notna(value)
+                else "N/A"
             )
-            if finding["details"]
-            else "N/A"
         ),
-        "Details": finding["description"],
-    }
-    for _, finding in findings.iterrows()
-    ])
+        "Destination IP": related_event_data["dest_ip"].fillna("N/A"),
+        "Destination Port": related_event_data["dest_port"].apply(
+            lambda value: (
+                str(int(value))
+                if pd.notna(value)
+                else "N/A"
+            )
+        ),
+        "Protocol": related_event_data["proto"].fillna("N/A"),
+    })
 
     st.dataframe(
         related_events,
         width="stretch",
-        hide_index=True
+        hide_index=True,
     )
 
 else:
-    st.info("No related events are available.")
-
+    st.info(
+        "No linked network events are available for this case. "
+        "The associated findings may not contain event references."
+    )
 
 # --------------------------------------------------
 # MITRE ATT&CK Mapping
@@ -182,7 +221,6 @@ st.info(
     "No MITRE ATT&CK mapping is currently available."
 )
 
-
 # --------------------------------------------------
 # Primary Evidence
 # --------------------------------------------------
@@ -191,11 +229,62 @@ st.divider()
 
 st.subheader("Primary Evidence")
 
-st.info(
-    "No primary evidence is currently available "
-    "for this case."
-)
+if findings.empty:
 
+    st.info(
+        "No detection findings are available for this case."
+    )
+
+else:
+
+    st.caption(
+        "Evidence below comes from the detection findings and linked "
+        "network events stored by the analysis pipeline."
+    )
+
+    for _, finding in findings.iterrows():
+
+        rule_name = finding["rule_name"]
+        finding_id = finding["finding_id"]
+        finding_timestamp = finding["timestamp"]
+        description = finding["description"]
+        source_ip = finding["source_ip"]
+        finding_priority = finding["priority"]
+
+        with st.expander(
+            f"{rule_name} — {finding_id}"
+        ):
+            st.markdown("**Detection rule**")
+            st.write(rule_name)
+
+            st.markdown("**Timestamp**")
+            st.write(finding_timestamp or "N/A")
+
+            st.markdown("**Source IP**")
+            st.write(source_ip or "N/A")
+
+            st.markdown("**Description**")
+            st.write(description or "No description available.")
+
+            st.markdown("**Finding priority**")
+            st.write(
+                finding_priority
+                if pd.notna(finding_priority)
+                else "N/A"
+            )
+
+            # Show the event IDs associated with this finding.
+            finding_event_ids = finding["event_ids"]
+
+            st.markdown("**Linked event IDs**")
+
+            if finding_event_ids:
+                st.write(", ".join(
+                    str(event_id)
+                    for event_id in finding_event_ids
+                ))
+            else:
+                st.write("No event IDs linked to this finding.")
 
 # --------------------------------------------------
 # Notes

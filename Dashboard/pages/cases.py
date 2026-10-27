@@ -3,7 +3,6 @@ import pandas as pd
 
 from data.analysis_data import get_cases
 
-
 # --------------------------------------------------
 # Page title
 # --------------------------------------------------
@@ -12,7 +11,6 @@ st.title("Cases")
 st.write(
     "Overview of all cases identified by the threat analysis system."
 )
-
 
 # --------------------------------------------------
 # Case table data
@@ -23,7 +21,9 @@ cases = get_cases()
 case_table = pd.DataFrame([
     {
         "ID": case["case_id"],
-        "Type": "Pending",
+        "Type": ", ".join(case["rule_ids"])
+        if case["rule_ids"]
+        else "Unclassified",
         "Source IP": ", ".join(case["source_ips"])
         if case["source_ips"]
         else "N/A",
@@ -32,7 +32,6 @@ case_table = pd.DataFrame([
     }
     for _, case in cases.iterrows()
 ])
-
 
 # --------------------------------------------------
 # Filters
