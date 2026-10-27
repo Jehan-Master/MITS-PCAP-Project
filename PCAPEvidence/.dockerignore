@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+tests/
+*.db
+*.sqlite
+*.sqlite3
+*.pcap
+*.pcapng
+.env
+Dockerfile
+.dockerignore

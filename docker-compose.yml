@@ -1,0 +1,34 @@
+services:
+  dashboard:
+    build: ./Dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./database:/data
+    environment:
+      MITS_DB_PATH: /data/mits.db
+    restart: unless-stopped
+
+  ingest:
+    build: ./DataInitialFiltering
+    volumes:
+      - ./input:/input:ro
+      - ./database:/data
+    profiles: ["tools"]
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Pipeline/Dockerfile
+    volumes:
+      - ./input:/input:ro
+      - ./database:/data
+    profiles: ["tools"]
+
+  pcap-evidence:
+    build: ./PCAPEvidence
+    volumes:
+      - ./pcap:/pcap:ro
+      - ./database:/data
+      - ./evidence:/evidence
+    profiles: ["pcap"]

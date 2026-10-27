@@ -13,6 +13,22 @@ The goal is to make large volumes of honeynet data easier to understand, filter,
 
 ## Getting Started
 
+### Quick start (Docker)
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and start it (wait until it reports that the engine is running).
+2. Open a terminal in the repository root.
+3. Start the app:
+   ```
+   docker compose up --build
+   ```
+4. Open the dashboard at http://localhost:8501.
+5. Stop the app (press `Ctrl+C` first if it is running in the terminal):
+   ```
+   docker compose down
+   ```
+
+Keep `--build` so your latest code changes are included. The database lives in the `database/` folder on your machine, so it is kept after `docker compose down`. More details are in [Executing program](#executing-program).
+
 ### Dependencies
 
 Before running the program, ensure you have:
@@ -30,23 +46,100 @@ Before running the program, ensure you have:
 
 ### Installing
 
-[//]: # (* How/where to download your program)
-[//]: # (* Any modifications needed to be made to files/folders)
+The recommended way to run the prototype is with Docker. With Docker, Python and pip do **not** need to be installed on your own machine — every part runs in a container with its own Python 3.14 and pinned packages.
+
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+2. Clone the repository:
+   ```
+   git clone https://github.com/Jehan-Master/MITS-PCAP-Project.git
+   ```
+3. Start Docker Desktop before running any of the commands below.
+
+The project uses these folders in the repository root for data. They are created automatically on first use, mounted into the containers, and ignored by git, so large datasets and the database never end up in an image or a commit:
+
+| Folder | Contents | Used by |
+|---|---|---|
+| `input/` | Suricata `eve.json` files | ingestion, analysis pipeline |
+| `database/` | the shared SQLite database `mits.db` | all parts |
+| `pcap/` | `.pcap` / `.pcapng` files | PCAP evidence |
+| `evidence/` | optional per-case PCAPNG exports | PCAP evidence |
+
+### Docker setup
+
+| Service | Built from | What it does | How to run it |
+|---|---|---|---|
+| `dashboard` | `Dashboard/` | Streamlit dashboard on port 8501 | `docker compose up` |
+| `ingest` | `DataInitialFiltering/` | loads `eve.json` files into `mits.db` | `docker compose run --rm ingest` |
+| `pipeline` | repository root, `Pipeline/Dockerfile` | sessions, rule-based detection and candidate cases | `docker compose run --rm pipeline` |
+| `pcap-evidence` | `PCAPEvidence/` | links cases to packets with TShark | `docker compose run --rm pcap-evidence` |
+
+* `ingest`, `pipeline` and `pcap-evidence` process data and then stop. They are only run when you call them by name. In `docker-compose.yml` this is done with a profile: `tools` for `ingest` and `pipeline`, `pcap` for `pcap-evidence`. To build them, add the profile to the command, for example `docker compose --profile tools build`.
+* Every service uses the same `database/` folder, mounted as `/data` inside the containers, and opens `/data/mits.db`. The dashboard receives this path in the `MITS_DB_PATH` environment variable. Newly analysed data is visible in the dashboard without rebuilding.
+* `input/` and `pcap/` are set up to be read-only, so the containers cannot change the original data.
+* The `pipeline` image is built from the repository root because its code imports `Dashboard.analysis`. The `.dockerignore` in the root only lets `Dashboard/analysis/` and `Pipeline/requirements.txt` through, so the large `input/` and `database/` folders are never sent to Docker.
+* The `.dockerignore` files in the service folders keep virtual environments, cache files, databases and `.env` files out of the images.
 
 ### Executing program
 
-[//]: # (* How to run the program)
-[//]: # (* Step-by-step bullets)
-[//]: # (```)
-[//]: # (code blocks for commands)
-[//]: # (```)
+All commands are run from the repository root.
+
+**1. Ingest EVE-JSON data into the database**
+
+Copy one or more `eve.json` files into `input/`, then run:
+```
+docker compose run --rm ingest /input/eve.json
+```
+Several files can be passed at once (`/input/day1.json /input/day2.json`). The database is written to `database/mits.db`. Running the same file again does not create duplicate rows.
+
+**2. Run the analysis**
+
+Build the sessions, findings and candidate cases from the ingested events:
+```
+docker compose run --rm pipeline
+```
+The pipeline can also ingest files first, which combines steps 1 and 2 in one command:
+```
+docker compose run --rm pipeline /input/eve.json
+```
+It ends with a summary of the number of events, sessions, findings and cases. Running it again re-analyses the data that is already in the database.
+
+**3. Start the dashboard**
+```
+docker compose up --build
+```
+Open http://localhost:8501 in a browser. Stop it with:
+```
+docker compose down
+```
+
+**4. Extract PCAP evidence**
+
+Copy capture files into `pcap/`, then run:
+```
+docker compose run --rm pcap-evidence
+```
+
+**After changing code or `requirements.txt`**, rebuild the images so the change is included:
+```
+docker compose --profile tools build
+```
+Once the PCAP evidence code is merged, use `docker compose --profile tools --profile pcap build` to rebuild that image as well.
 
 ## Help
 
-[//]: # (Any advise for common problems or issues.)
-[//]: # (```)
-[//]: # (command to run if program contains helper info)
-[//]: # (```)
+* **`failed to connect to the docker API` / `cannot find the file specified`** – Docker Desktop is not running. Start it and wait until it reports that the engine is running.
+* **Port 8501 is already in use** – another Streamlit instance is running. Stop it, or change the left-hand port in `docker-compose.yml` (e.g. `"8502:8501"`) and open http://localhost:8502.
+* **`ModuleNotFoundError` inside a container** – a package is imported in the code but missing from that part's `requirements.txt`. Add it (with a pinned version) and rebuild.
+* **Code changes do not show up** – the image still contains the old code. Rebuild with `docker compose up --build`.
+* **`input file not found: /input/...`** – the file is not in the `input/` folder, or the path after `ingest` does not start with `/input/`.
+* **Database location in code** – inside Docker the database is at `/data/mits.db`, and the dashboard receives this path in the `MITS_DB_PATH` environment variable. Code that opens the database should read that variable instead of using a fixed path.
+
+Show the options of each command-line tool:
+```
+docker compose run --rm ingest --help
+docker compose run --rm pipeline --help
+docker compose run --rm pcap-evidence --help
+```
 
 ## Authors
 

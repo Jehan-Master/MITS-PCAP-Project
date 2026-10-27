@@ -232,4 +232,19 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# MITS project data
+input/
+database/
+pcap/
+evidence/
+
+# Packet capture files
+*.pcap
+*.pcapng
+
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3
+
 # End of https://www.toptal.com/developers/gitignore/api/macos,windows,python
