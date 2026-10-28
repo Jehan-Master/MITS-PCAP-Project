@@ -3,9 +3,7 @@ import pandas as pd
 import plotly.express as px
 
 from datetime import timedelta
-
-from data.fake_cases import FAKE_CASES
-
+from data.database import get_events
 
 # --------------------------------------------------
 # Page title
@@ -17,60 +15,50 @@ st.write(
     "analysis system."
 )
 
-
 # --------------------------------------------------
 # Prepare event data
 # --------------------------------------------------
 
-events = []
+events_df = get_events()
 
-for case in FAKE_CASES:
-    for event in case.get("events", []):
-        events.append(
-            {
-                "Case ID": case["id"],
-                "Timestamp": event.get("timestamp"),
-                "Event Type": event.get("type", "Unknown"),
-                "Source IP": event.get("source_ip", "N/A"),
-                "Destination IP": event.get(
-                    "destination_ip",
-                    "N/A"
-                ),
-                "Destination Port": event.get(
-                    "destination_port",
-                    "N/A"
-                ),
-                "Protocol": event.get(
-                    "protocol",
-                    "N/A"
-                ),
-                "Priority": case.get(
-                    "priority",
-                    "Low"
-                ),
-                "Evidence": event.get(
-                    "evidence",
-                    "N/A"
-                )
-            }
-        )
-
-
-if not events:
-    st.info("No events are currently available.")
+if events_df.empty:
+    st.info("No network events are currently available.")
     st.stop()
 
+# Rename database columns for the dashboard.
+events_df = events_df.rename(
+    columns={
+        "id": "Event ID",
+        "ts": "Timestamp",
+        "event_type": "Event Type",
+        "src_ip": "Source IP",
+        "src_port": "Source Port",
+        "dest_ip": "Destination IP",
+        "dest_port": "Destination Port",
+        "proto": "Protocol",
+        "app_proto": "Application Protocol",
+        "alert_sid": "Alert SID",
+        "alert_signature": "Alert Signature",
+        "alert_severity": "Alert Severity",
+    }
+)
 
-events_df = pd.DataFrame(events)
-
+# Parse mixed timestamp formats and normalize to UTC.
 events_df["Timestamp"] = pd.to_datetime(
-    events_df["Timestamp"]
+    events_df["Timestamp"],
+    format="mixed",
+    errors="coerce",
+    utc=True,
 )
 
-events_df = events_df.sort_values(
-    "Timestamp"
-)
+# Remove records with invalid timestamps.
+events_df = events_df.dropna(subset=["Timestamp"])
 
+if events_df.empty:
+    st.info("No network events with valid timestamps are available.")
+    st.stop()
+
+events_df = events_df.sort_values("Timestamp")
 
 # --------------------------------------------------
 # Determine available time range
@@ -82,7 +70,6 @@ available_years = sorted(
     events_df["Timestamp"].dt.year.unique(),
     reverse=True
 )
-
 
 # --------------------------------------------------
 # Timeframe selector
@@ -157,45 +144,29 @@ if filtered_events.empty:
     )
 
 else:
-    priority_order = [
-        "High",
-        "Medium",
-        "Low",
-        "Info"
-    ]
-
-    filtered_events = filtered_events.copy()
-
-    filtered_events["Priority"] = pd.Categorical(
-        filtered_events["Priority"],
-        categories=priority_order,
-        ordered=True
-    )
-
     fig = px.scatter(
         filtered_events,
         x="Timestamp",
-        y="Priority",
-        color="Priority",
-        category_orders={
-            "Priority": priority_order
-        },
+        y="Event Type",
+        color="Event Type",
         hover_data={
-            "Case ID": True,
+            "Event ID": True,
             "Event Type": True,
             "Source IP": True,
+            "Source Port": True,
             "Destination IP": True,
             "Destination Port": True,
             "Protocol": True,
+            "Application Protocol": True,
+            "Alert SID": True,
+            "Alert Signature": True,
+            "Alert Severity": True,
             "Timestamp": True,
-            "Priority": True
-        }
+        },
     )
 
     fig.update_traces(
-        marker=dict(
-            size=9
-        )
+        marker=dict(size=9)
     )
 
     fig.update_layout(
@@ -204,29 +175,28 @@ else:
             t=20,
             b=20,
             l=20,
-            r=20
+            r=20,
         ),
         xaxis_title=None,
         yaxis_title=None,
-        legend_title=None
+        legend_title=None,
     )
 
     st.plotly_chart(
         fig,
-        width="stretch"
+        width="stretch",
     )
-
 
 # --------------------------------------------------
 # Event table
 # --------------------------------------------------
 
-st.subheader("Events")
-
+st.subheader("Network Events")
 
 if filtered_events.empty:
     st.info(
-        "No events are available for the selected timeframe."
+        "No network events are available "
+        "for the selected timeframe."
     )
 
 else:
@@ -234,35 +204,37 @@ else:
 
     table_data["Timestamp"] = (
         table_data["Timestamp"]
-        .dt.strftime("%Y-%m-%d %H:%M:%S")
+        .dt.strftime("%Y-%m-%d %H:%M:%S UTC")
     )
 
-    table_data["Details"] = table_data.apply(
-        lambda row: (
-            f'{row["Event Type"]} — '
-            f'{row["Destination IP"]}:'
-            f'{row["Destination Port"]} '
-            f'({row["Protocol"]})'
-        ),
-        axis=1
-    )
+    # Build Details using available alert information.
+    #def format_event_details(row):
+    #    if pd.notna(row["Alert Signature"]):
+    #        return f'Alert: {row["Alert Signature"]}'
+
+    #    return ""
+
+    #table_data["Details"] = table_data.apply(
+    #    format_event_details,
+    #    axis=1,
+    #"""
 
     table_data = table_data[
         [
             "Timestamp",
             "Event Type",
             "Source IP",
-            "Details",
-            "Priority"
+            "Destination IP",
+            "Protocol",
+            #"Details",
         ]
     ]
 
     st.dataframe(
         table_data,
         width="stretch",
-        hide_index=True
+        hide_index=True,
     )
-
 
 # --------------------------------------------------
 # Prototype notice
@@ -271,6 +243,6 @@ else:
 st.divider()
 
 st.caption(
-    "Prototype dashboard — timeline data currently represents "
-    "example values."
+    "Prototype dashboard — timeline data is generated from "
+    "the current analysis results."
 )
