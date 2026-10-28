@@ -2,8 +2,14 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from data.fake_cases import FAKE_CASES
-
+from data.database import get_events
+from analysis.detection import (
+    load_events as load_detection_events,
+    build_high_connection_findings,
+    build_multi_port_findings,
+    detect_repeated_failed_authentication,
+    build_protocol_anomaly_findings,
+)
 
 # --------------------------------------------------
 # Page configuration
@@ -27,72 +33,228 @@ st.write(
     "and detected suspicious behaviour."
 )
 
+# --------------------------------------------------
+# Load real event data
+# --------------------------------------------------
+
+event_data_available = False
+event_load_error = None
+
+try:
+    events = get_events()
+
+    if events is None:
+        events = pd.DataFrame()
+
+    event_data_available = True
+
+except Exception as error:
+    events = pd.DataFrame()
+    event_load_error = error
+    st.error(f"Database error: {type(error).__name__}: {error}")
+
+# No fake cases are loaded.
+# Real case creation and prioritization are still pending.
+cases = pd.DataFrame(
+    columns=["ID", "Type", "Source IP", "Priority", "Status"]
+)
+
+# Rename database columns to match the dashboard naming.
+
+events = events.rename(
+    columns={
+        "ts": "Timestamp",
+        "event_type": "Event Type",
+        "src_ip": "Source IP",
+        "src_port": "Source Port",
+        "dest_ip": "Destination IP",
+        "dest_port": "Destination Port",
+        "proto": "Protocol",
+        "app_proto": "Application Protocol",
+    }
+)
+
+# Ensure the dashboard's expected columns exist.
+required_columns = [
+    "Timestamp",
+    "Event Type",
+    "Source IP",
+    "Source Port",
+    "Destination IP",
+    "Destination Port",
+    "Protocol",
+    "Application Protocol",
+]
+
+for column in required_columns:
+    if column not in events.columns:
+        events[column] = pd.NA
+
+events["Timestamp"] = pd.to_datetime(
+    events["Timestamp"],
+    errors="coerce",
+)
 
 # --------------------------------------------------
-# Prepare case and event data
+# Run implemented rule-based detection
 # --------------------------------------------------
 
-case_data = []
+suspicious_event_count = None
+detection_error = None
 
-event_data = []
+try:
+    detection_events = load_detection_events()
 
-for case in FAKE_CASES:
-
-    # Store case-level information
-    case_data.append(
-        {
-            "ID": case.get("id", "N/A"),
-            "Type": case.get("type", "Unknown"),
-            "Source IP": case.get("source_ip", "N/A"),
-            "Priority": case.get("priority", "Unknown"),
-            "Status": case.get("status", "Unknown")
-        }
+    r01_findings = build_high_connection_findings(
+        detection_events
     )
 
-    # Store event-level information
-    for event in case.get("events", []):
+    r02_findings = build_multi_port_findings(
+        detection_events
+    )
 
-        event_data.append(
-            {
-                "Case ID": case.get("id", "N/A"),
-                "Timestamp": event.get("timestamp", "N/A"),
-                "Case Type": event.get("type", "Unknown"),
-                "Source IP": event.get("source_ip", "N/A"),
-                "Destination IP": event.get(
-                    "destination_ip",
-                    "N/A"
-                ),
-                "Destination Port": event.get(
-                    "destination_port",
-                    "N/A"
-                ),
-                "Protocol": event.get(
-                    "protocol",
-                    "N/A"
-                ),
-                "Priority": case.get(
-                    "priority",
-                    "Low"
-                ),
-                "Evidence": event.get(
-                    "evidence",
-                    "N/A"
-                )
-            }
+    r03_findings = detect_repeated_failed_authentication(
+        detection_events
+    )
+
+    r04_findings = build_protocol_anomaly_findings(
+        detection_events
+    )
+
+    all_findings = (
+        r01_findings
+        + r02_findings
+        + r03_findings
+        + r04_findings
+    )
+
+    suspicious_event_ids = set()
+
+    for finding in all_findings:
+        suspicious_event_ids.update(
+            finding.get("event_ids", [])
         )
 
+    suspicious_event_count = len(suspicious_event_ids)
 
-cases = pd.DataFrame(case_data)
-events = pd.DataFrame(event_data)
+except Exception as error:
+    detection_error = error
+    st.error(f"Detection error: {type(error).__name__}: {error}")
+
+# --------------------------------------------------
+# Event filters
+# --------------------------------------------------
+
+st.subheader("Event Filters")
+
+filter_col1, filter_col2, filter_col3, filter_col4 = (
+    st.columns(4)
+)
 
 
-# Convert timestamps into datetime values
-if not events.empty:
-    events["Timestamp"] = pd.to_datetime(
-        events["Timestamp"],
-        errors="coerce"
+# Event Type filter
+
+with filter_col1:
+
+    event_type_options = ["All"] + sorted(
+        events["Event Type"]
+        .dropna()
+        .unique()
+        .tolist()
     )
 
+    selected_event_type = st.selectbox(
+        "Event Type",
+        event_type_options,
+    )
+
+
+# Protocol filter
+
+with filter_col2:
+
+    protocol_options = ["All"] + sorted(
+        events["Protocol"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    selected_protocol = st.selectbox(
+        "Protocol",
+        protocol_options,
+    )
+
+
+# Source IP filter
+
+with filter_col3:
+
+    source_ip_options = ["All"] + sorted(
+        events["Source IP"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    selected_source_ip = st.selectbox(
+        "Source IP",
+        source_ip_options,
+    )
+
+
+# Destination IP filter
+
+with filter_col4:
+
+    destination_ip_options = ["All"] + sorted(
+        events["Destination IP"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    selected_destination_ip = st.selectbox(
+        "Destination IP",
+        destination_ip_options,
+    )
+
+
+# Apply filters
+
+filtered_events = events.copy()
+
+
+if selected_event_type != "All":
+
+    filtered_events = filtered_events[
+        filtered_events["Event Type"]
+        == selected_event_type
+    ]
+
+
+if selected_protocol != "All":
+
+    filtered_events = filtered_events[
+        filtered_events["Protocol"]
+        == selected_protocol
+    ]
+
+
+if selected_source_ip != "All":
+
+    filtered_events = filtered_events[
+        filtered_events["Source IP"]
+        == selected_source_ip
+    ]
+
+
+if selected_destination_ip != "All":
+
+    filtered_events = filtered_events[
+        filtered_events["Destination IP"]
+        == selected_destination_ip
+    ]
 
 # --------------------------------------------------
 # Overview metrics
@@ -102,48 +264,41 @@ st.subheader("Overview")
 
 col1, col2, col3, col4 = st.columns(4)
 
-
-# Total number of events
-total_events = len(events)
-
-
-# In the current prototype, all events belong to
-# detected suspicious cases.
-suspicious_events = len(events)
-
-
-# Number of cases currently represented
-prioritized_cases = len(cases)
-
-
-# Number of cases with an ATT&CK mapping
-attack_mappings = sum(
-    1
-    for case in FAKE_CASES
-    if case.get("attack_mapping")
-)
-
-
 col1.metric(
     "Total Events",
-    total_events
+    f"{len(events):,}" if event_data_available else "Pending",
 )
 
 col2.metric(
     "Suspicious Events",
-    suspicious_events
+    (
+        f"{suspicious_event_count:,}"
+        if suspicious_event_count is not None
+        else "Pending"
+    ),
 )
 
 col3.metric(
     "Prioritized Cases",
-    prioritized_cases
+    "Pending",
 )
 
 col4.metric(
     "ATT&CK Mappings",
-    attack_mappings
+    "Pending",
 )
 
+if not event_data_available:
+    st.warning(
+        "Real event data is unavailable. "
+        "Event counts and charts are Pending."
+    )
+
+if detection_error is not None:
+    st.warning(
+        "Detection results are Pending because "
+        "the detection module could not produce a result."
+    )
 
 # --------------------------------------------------
 # Event charts
@@ -169,8 +324,9 @@ with chart_col1:
     else:
 
         # Group events by day
+
         timeline_data = (
-            events
+            filtered_events
             .dropna(subset=["Timestamp"])
             .assign(
                 Date=lambda df: df["Timestamp"].dt.date
@@ -217,37 +373,36 @@ with chart_col1:
 
 
 # --------------------------------------------------
-# Case Types
+# Event Types
 # --------------------------------------------------
 
 with chart_col2:
 
-    st.subheader("Case Types")
+    st.subheader("Event Types")
 
-    if cases.empty:
+    if events.empty:
 
         st.info(
-            "No case data is currently available."
+            "No event data is currently available."
         )
 
     else:
 
-        # Count cases by detected case type
         event_types = (
-            cases["Type"]
+            filtered_events["Event Type"]
             .value_counts()
             .reset_index()
         )
 
         event_types.columns = [
-            "Case Type",
-            "Cases"
+            "Event Type",
+            "Events"
         ]
 
         fig = px.pie(
             event_types,
-            names="Case Type",
-            values="Cases",
+            names="Event Type",
+            values="Events",
             hole=0.35
         )
 
@@ -266,70 +421,16 @@ with chart_col2:
             width="stretch"
         )
 
-
 # --------------------------------------------------
 # Top Investigated Cases
 # --------------------------------------------------
 
 st.subheader("Top Investigated Cases")
 
-
-if cases.empty:
-
-    st.info(
-        "No cases are currently available."
-    )
-
-else:
-
-    # Currently use the first five cases.
-    # Later, this can be replaced by the actual
-    # prioritization/ranking produced by the analysis pipeline.
-    top_cases = cases.head(5)
-
-
-    # Table header
-    header_col1, header_col2, header_col3, header_col4, header_col5 = st.columns(
-        [1, 2, 2, 1, 1]
-    )
-
-    header_col1.write("**ID**")
-    header_col2.write("**Type**")
-    header_col3.write("**Source IP**")
-    header_col4.write("**Priority**")
-    header_col5.write("**Status**")
-
-    st.divider()
-
-
-    # Table rows
-    for _, case in top_cases.iterrows():
-
-        col1, col2, col3, col4, col5 = st.columns(
-            [1, 2, 2, 1, 1]
-        )
-
-        with col1:
-
-            if st.button(
-                case["ID"],
-                key=f"overview_case_{case['ID']}",
-                type="tertiary"
-            ):
-
-                st.session_state[
-                    "selected_case"
-                ] = case["ID"]
-
-                st.switch_page(
-                    "pages/case_detail.py"
-                )
-
-        col2.write(case["Type"])
-        col3.write(case["Source IP"])
-        col4.write(case["Priority"])
-        col5.write(case["Status"])
-
+st.info(
+    "Pending — real case creation, prioritization, "
+    "and case status are not yet connected."
+)
 
 # --------------------------------------------------
 # Footer
@@ -338,6 +439,7 @@ else:
 st.divider()
 
 st.caption(
-    "Prototype dashboard — metrics and case data "
-    "currently use example values."
+    "Prototype dashboard — case data and "
+    "ATT&CK information still use example "
+    "values or pending functionality."
 )
