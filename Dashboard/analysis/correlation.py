@@ -2,9 +2,8 @@ import json
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
-from pathlib import Path
+from project_paths import DATABASE_FILE
 
-DATABASE_FILE = Path(__file__).resolve().parent.parent / "database" / "mits_test.db"
 INACTIVITY_GAP_MINUTES = 5
 LARGEST_SESSION_LIMIT = 10
 
