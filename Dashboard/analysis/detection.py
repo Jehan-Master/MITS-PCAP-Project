@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import ipaddress
+from project_paths import DATABASE_FILE
 
 # Casting a tz-aware column to datetime64[ns] (done throughout this file,
 # deliberately, to get consistent naive/UTC-equivalent timestamps across
@@ -21,11 +22,7 @@ warnings.filterwarnings(
 )
 
 
-DATABASE_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "database"
-    / "mits_test.db"
-)
+DATABASE_PATH = DATABASE_FILE
 
 HIGH_CONNECTION_THRESHOLD = 20
 HIGH_CONNECTION_WINDOW_SECONDS = 60
