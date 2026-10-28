@@ -1,3 +1,4 @@
+from project_paths import DATABASE_FILE
 import argparse
 import base64
 import hashlib
@@ -181,11 +182,22 @@ def ingest_file(connection, path):
     return stored_types, skipped_types, malformed_lines, new_rows
 
 
-def open_database(db_path):
+def open_database(db_path=DATABASE_FILE):
+    """Open or create the database and initialize the events schema."""
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
     connection = sqlite3.connect(db_path)
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA synchronous = NORMAL")
-    connection.executescript(SCHEMA_SQL)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.executescript(SCHEMA_SQL)
+        connection.executescript(INDEX_SQL)
+        connection.commit()
+    except Exception:
+        connection.close()
+        raise
+
     return connection
 
 
@@ -208,8 +220,7 @@ def parse_arguments():
         description="Load Suricata eve.json files into the shared MITS SQLite database."
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="one or more eve.json files")
-    parser.add_argument("--db", type=Path, default=Path("mits.db"),
-                        help="path to the SQLite database (default: mits.db)")
+    parser.add_argument("--db", type=Path, default=DATABASE_FILE, help="path to the SQLite database")
     return parser.parse_args()
 
 
