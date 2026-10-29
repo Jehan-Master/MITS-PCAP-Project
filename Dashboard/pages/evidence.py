@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 
-from data.fake_cases import FAKE_CASES
 from data.analysis_data import get_cases, get_case_findings, get_events_by_ids, get_suricata_alerts
 
 
