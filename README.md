@@ -11,6 +11,64 @@ The prototype groups related events into sessions/campaigns, maps behaviour to M
 
 The goal is to make large volumes of honeynet data easier to understand, filter, and investigate.
 
+### How it works
+
+Every part reads from and writes to one shared SQLite database, `database/mits.db`:
+
+```
+eve.json ─► Ingestion ─► events ─► Sessions ─► Rule-based detection ─► findings ─► Cases
+                                                                                    │
+                          ┌─────────────────────────────┬───────────────────────────┤
+                          ▼                             ▼                           ▼
+                   PCAP evidence                Anomaly detection          Case prioritization
+                   (pcap_evidence)              (anomaly_* tables)         (output files)
+                                                        │
+                                                        ▼
+                                                Streamlit dashboard
+```
+
+The order matters: PCAP evidence needs cases, cases need findings, and findings need events.
+
+Rule-based detection (`Dashboard/analysis/detection.py`) currently implements four rules:
+
+| Rule | Name | Fires when |
+|---|---|---|
+| R01 | High Connection Rate | one source opens 20+ distinct flows within the rule's time window |
+| R02 | Multi-Port Activity | an external source contacts 3+ distinct ports on internal hosts within the window |
+| R03 | Repeated Failed Authentication | 3+ failed FTP logins from one source within the window |
+| R04 | Repeated External Protocol Anomaly | 2+ Suricata `anomaly` events from an external source to internal hosts within the window |
+
+Thresholds and window sizes are constants at the top of `detection.py`.
+
+### Current status
+
+| Part | Status | Notes |
+|---|---|---|
+| Ingestion | Working | Re-ingesting the same file does not create duplicates |
+| Sessions, detection (R01–R04), case correlation | Working | Optimised for large datasets (see [Performance](#performance)) |
+| Statistical anomaly detection | Working | Results are stored in the database, not yet shown in the dashboard |
+| PCAP evidence | Working, but slow | Still needs work: matching is slow on large captures and many cases (see [PCAP evidence performance](#pcap-evidence-performance)). Results are stored in the database, not yet shown in the dashboard |
+| Case prioritization (Isolation Forest) | Working, standalone | Runs locally, writes result files, not yet connected to the database or dashboard |
+| Dashboard: Cases, Case Detail | Working | Read real data from the database |
+| Dashboard: Timeline | Working, slow on a full dataset | Loads every event when the page opens (see [Dashboard performance](#dashboard-performance)) |
+| Dashboard: Overview, Evidence | Partly working | Evidence reads real data, but its PCAP tab is not linked yet. Overview still contains placeholder sections and takes too long to display on a full dataset (see [Dashboard performance](#dashboard-performance)) |
+| MITRE ATT&CK mapping | Not implemented yet | |
+
+### Still to be implemented
+
+1. Finish the dashboard Overview page: replace its placeholder ("Pending") sections with real data, and stop it from re-running detection every time it loads.
+2. Make the dashboard usable on a full dataset: the Overview and Timeline pages take too long to display (see [Dashboard performance](#dashboard-performance)).
+3. Speed up PCAP evidence. It works, but it is slow and needs further optimisation (see [PCAP evidence performance](#pcap-evidence-performance)).
+4. Show PCAP evidence in the dashboard (the data is already in the `pcap_evidence` table), including a way to download the evidence PCAP of a case.
+5. Show anomaly findings in the dashboard (the data is already in the `anomaly_*` tables).
+6. Integrate case prioritization: read the existing findings and cases from the database instead of recomputing them, store the priority in the database, containerize it, and sort/filter cases by priority in the dashboard.
+7. Use one database path everywhere (`database/mits.db` in the repository root, overridable with `MITS_DB_PATH`).
+8. MITRE ATT&CK mapping for rules and cases.
+9. Automated tests for detection and case correlation (only `AnomalyDetection/` has a unit test suite at the moment).
+10. Incremental processing, so new data does not require re-analysing everything.
+11. Normalise timestamps to UTC during ingestion.
+12. Improve Docker performance on Windows (see [Performance](#performance)).
+
 ## Getting Started
 
 ### Quick start (Docker)
@@ -33,16 +91,17 @@ Keep `--build` so your latest code changes are included. The database lives in t
 
 Before running the program, ensure you have:
 
-* Python 3.10+
+* Python 3.10+ (only needed to run things outside Docker)
 
 * Docker 
 
 * pip for installing Python packages
 
+* Wireshark / TShark (only needed to run PCAP evidence outside Docker; it is already included in the Docker image)
+
 * Operating system: Windows 10/11 or Linux
 
-[//]: # (* Required Python libraries:)
-[//]: # (Commented until we know ƪ[˘⌣˘]ʃ )
+Python packages used: pandas, numpy, orjson, streamlit, plotly and scikit-learn. They are pinned in the `requirements.txt` files of the parts that use them.
 
 ### Installing
 
@@ -64,19 +123,45 @@ The project uses these folders in the repository root for data. They are created
 | `pcap/` | `.pcap` / `.pcapng` files | PCAP evidence |
 | `evidence/` | optional per-case PCAPNG exports | PCAP evidence |
 
+#### Running without Docker (optional)
+
+Running locally is considerably faster than Docker on Windows (see [Performance](#performance)), which makes it the better choice for development. From the repository root:
+
+```
+python -m venv .venv
+.venv\Scripts\Activate.ps1          # Linux: source .venv/bin/activate
+pip install -r Pipeline/requirements.txt
+pip install -r Dashboard/requirements.txt
+pip install -r DataInitialFiltering/requirements.txt
+```
+
+The prompt should show `(.venv)` once the environment is active. Packages installed inside Docker are **not** available locally and the other way around, so both setups need their own dependencies.
+
 ### Docker setup
 
 | Service | Built from | What it does | How to run it |
 |---|---|---|---|
 | `dashboard` | `Dashboard/` | Streamlit dashboard on port 8501 | `docker compose up` |
 | `ingest` | `DataInitialFiltering/` | loads `eve.json` files into `mits.db` | `docker compose run --rm ingest` |
-| `pipeline` | repository root, `Pipeline/Dockerfile` | sessions, rule-based detection and candidate cases | `docker compose run --rm pipeline` |
+| `pipeline` | repository root, `Pipeline/Dockerfile` | sessions, rule-based detection, candidate cases and (optionally) anomaly detection | `docker compose run --rm pipeline` |
 | `pcap-evidence` | `PCAPEvidence/` | links cases to packets with TShark | `docker compose run --rm pcap-evidence` |
 
-* `ingest`, `pipeline` and `pcap-evidence` process data and then stop. They are only run when you call them by name. In `docker-compose.yml` this is done with a profile: `tools` for `ingest` and `pipeline`, `pcap` for `pcap-evidence`. To build them, add the profile to the command, for example `docker compose --profile tools build`.
+What is containerized and what is not:
+
+| Part | Containerized | Notes |
+|---|---|---|
+| Dashboard | Yes | `dashboard` service |
+| Ingestion | Yes | `ingest` service |
+| Sessions, detection, cases | Yes | `pipeline` service |
+| Anomaly detection | Yes, inside `pipeline` | only runs when `--with-anomaly` is passed |
+| PCAP evidence | Yes | `pcap-evidence` service, TShark is installed in the image |
+| Case prioritization | No | runs locally; it needs scikit-learn, which is not in `Pipeline/requirements.txt` yet |
+| `check_evidence` / `check_anomalies` inspection tools | No | run locally |
+
+* `ingest`, `pipeline` and `pcap-evidence` process data and then stop. They are only run when you call them by name. In `docker-compose.yml` this is done with a profile: `tools` for `ingest` and `pipeline`, `pcap` for `pcap-evidence`. To build them, add the profiles to the command, for example `docker compose --profile tools --profile pcap build`.
 * Every service uses the same `database/` folder, mounted as `/data` inside the containers, and opens `/data/mits.db`. The dashboard receives this path in the `MITS_DB_PATH` environment variable. Newly analysed data is visible in the dashboard without rebuilding.
 * `input/` and `pcap/` are set up to be read-only, so the containers cannot change the original data.
-* The `pipeline` image is built from the repository root because its code imports `Dashboard.analysis`. The `.dockerignore` in the root only lets `Dashboard/analysis/` and `Pipeline/requirements.txt` through, so the large `input/` and `database/` folders are never sent to Docker.
+* The `pipeline` image is built from the repository root because its code imports `Dashboard.analysis`. The `.dockerignore` in the root denies everything by default and only lets these paths through: `Pipeline/requirements.txt`, `Dashboard/analysis/`, `Dashboard/project_paths.py` and `AnomalyDetection/`. The large `input/` and `database/` folders are therefore never sent to Docker. A file that the `pipeline` image needs must be added both to this allowlist and to a `COPY` line in `Pipeline/Dockerfile`; if either is missing the build fails with a "not found" error even though the file exists.
 * The `.dockerignore` files in the service folders keep virtual environments, cache files, databases and `.env` files out of the images.
 
 ### Executing program
@@ -101,13 +186,19 @@ The pipeline can also ingest files first, which combines steps 1 and 2 in one co
 ```
 docker compose run --rm pipeline /input/eve.json
 ```
-It ends with a summary of the number of events, sessions, findings and cases. Running it again re-analyses the data that is already in the database.
+Add `--with-anomaly` to also run statistical anomaly detection (median/MAD scoring of connection volume, destination fan-out and alert rate per source):
+```
+docker compose run --rm pipeline --with-anomaly
+```
+Tuning flags: `--anomaly-window-seconds` (default 60), `--anomaly-threshold` (default 3.5) and `--anomaly-min-source-windows` (default 5). The scoring method is described in `AnomalyDetection/README.md`; results are written to the `anomaly_windows`, `anomaly_baselines`, `anomaly_findings` and `anomaly_events` tables.
+
+The run ends with a summary of the number of events, sessions, findings, cases and anomaly findings. Running it again re-analyses the data that is already in the database; findings and cases are rebuilt from scratch each time.
 
 **3. Start the dashboard**
 ```
 docker compose up --build
 ```
-Open http://localhost:8501 in a browser. Stop it with:
+Open http://localhost:8501 in a browser. With a full dataset the Overview and Timeline pages take a long time to display (see [Dashboard performance](#dashboard-performance)). Stop it with:
 ```
 docker compose down
 ```
@@ -118,20 +209,118 @@ Copy capture files into `pcap/`, then run:
 ```
 docker compose run --rm pcap-evidence
 ```
+Matches are stored in the `pcap_evidence` table. Cases whose traffic falls outside the time range of the supplied captures correctly report "no matching packets found".
+
+**PCAP evidence is slow and still needs to be worked on.** With a full dataset (over a thousand cases) and large capture files, expect it to take a long time, and longer still in Docker than locally. It is best tested on a small capture and a small database first (for example `--limit 5` or `--case-id CASE-0001`). See [PCAP evidence performance](#pcap-evidence-performance).
+
+**5. Rank cases by priority (runs locally)**
+
+`Dashboard/analysis/prioritization.py` scores and ranks the candidate cases with an Isolation Forest model (scikit-learn). Run it from the repository root with the virtual environment active and `scikit-learn` installed:
+```
+python -u -m Dashboard.analysis.prioritization
+```
+It prints a ranked table and writes `prioritized_cases_v4.json`, `prioritized_cases_v4.csv` and `prioritization_features_v4.csv` to `Dashboard/output/`. It currently re-runs detection, sessions and case correlation itself instead of reading the stored results, so it takes about as long as the full pipeline, and it does not write anything back to the database. The priority is a relative percentile within the analysed dataset ("High" means more unusual than most other cases in that run, not an absolute severity).
+
+**Running the same steps locally (without Docker)**
+
+```
+python -u -m Dashboard.analysis.pipeline input\eve.json --db database\mits.db --with-anomaly
+python -u -m Dashboard.analysis.pipeline --db database\mits.db --with-anomaly     # existing database only
+python -m PCAPEvidence.pcap_evidence --db database\mits.db --pcap-dir pcap
+python -m PCAPEvidence.pcap_evidence --db database\mits.db --pcap-dir pcap --export-dir evidence
+python -m PCAPEvidence.check_evidence --db database\mits.db --limit 20
+python -m AnomalyDetection.check_anomalies --db database\mits.db --limit 20
+```
+Use `-u` (unbuffered output) so progress is shown while the program runs; without it the terminal can stay blank for minutes. Always pass `--db` explicitly when running locally. Exported per-case `.pcapng` files open directly in Wireshark; if a case was split into several parts, merge them with `mergecap -w merged.pcapng CASE-0009-part*.pcapng`.
 
 **After changing code or `requirements.txt`**, rebuild the images so the change is included:
 ```
-docker compose --profile tools build
+docker compose --profile tools --profile pcap build
 ```
-Once the PCAP evidence code is merged, use `docker compose --profile tools --profile pcap build` to rebuild that image as well.
+
+### Performance
+
+Measured on a real dataset (about 1.94 million events, 996 thousand flows) on a laptop with 16 GB RAM, running locally:
+
+| Stage | Approx. time |
+|---|---|
+| Session correlation | 1–4 min |
+| Rule-based detection R01–R04 | ~1–1.5 min |
+| Case correlation | ~40 s |
+| Anomaly detection | ~1.5–3 min |
+| Case prioritization | ~3 min |
+| PCAP evidence | slow, still to be optimised (see below) |
+
+A complete local run with anomaly detection takes roughly 5–10 minutes on this dataset.
+
+**Docker is noticeably slower than running locally on Windows.** The `database/` folder is a bind mount, so every SQLite read and write has to cross from the Windows file system into the WSL2 virtual machine that Docker Desktop uses. This translation is slow for the many small database operations the pipeline performs, so the same run takes considerably longer in Docker. Options:
+
+* Use a local virtual environment while developing and Docker for reproducible runs and for the dashboard.
+* Store the database in a named Docker volume instead of a bind mount. This avoids the slow layer, but the file can then no longer be opened directly from Windows.
+* Keep the project inside the WSL2 file system instead of on a Windows drive.
+
+Other things to know:
+
+* **Memory.** The full events table is loaded into memory and the raw Suricata JSON can take several GB on large data. On a 16 GB machine with other programs open, memory is the practical limit; high memory use with little CPU activity usually means the machine is swapping.
+* **No incremental processing.** Every run rebuilds findings, cases and anomaly tables from all events, so adding a small batch of new data means re-analysing everything.
+
+### Dashboard performance
+
+With the full sample data (about 1.94 million events) the dashboard is slow: the **Overview** and **Timeline** pages take too long to display, and longer still in Docker. The Cases, Case Detail and Evidence pages read only the cases and events they need and are much lighter.
+
+Why it is slow:
+
+* Both pages load the entire `events` table into memory (`get_events()` in `Dashboard/data/database.py`) every time they are opened.
+* The Overview page also loads the events a second time and re-runs all four detection rules on every load. That is the same work the pipeline already did and stored in the `findings` and `cases` tables, and it takes about as long here as it does in the pipeline.
+* Nothing is cached. Streamlit re-runs a page's script on every interaction (changing a filter, for example), so the loading and detection are repeated each time.
+* In Docker the database is a bind mount, which adds the slow Windows-to-WSL2 file access described above.
+
+Ideas for further work: read the findings and cases the pipeline already stored instead of re-running detection, aggregate in SQL (counts per event type, per hour, per source) instead of loading every row, select only the columns a page needs, cache loaded data with `st.cache_data`, and limit or paginate the Timeline. Until then, build a database from a small sample `eve.json` (for example in a separate file) when developing or demonstrating the dashboard, and use the full dataset for the pipeline.
+
+### PCAP evidence performance
+
+PCAP evidence is the slowest part of the system and still needs to be worked on. It works correctly, but the time it needs grows quickly with the number of cases and the size of the capture files, so it has not been tuned to the point of a smooth full-dataset run.
+
+What has been done so far:
+
+* Cases are grouped by capture file and TShark is run once per file and filter batch instead of once per case.
+* Very long filters are split into batches, because Windows limits the length of a command line (`WinError 206`).
+
+Why it is still slow:
+
+* TShark has to read the whole capture file once for every filter batch, and with many cases there are many batches.
+* The cases and their events are loaded from the database one case at a time.
+* In Docker the capture files and the database are bind-mounted, which adds the slow Windows-to-WSL2 file access described above.
+
+Ideas for further work: load cases and events in bulk, pre-filter captures with a coarse filter before matching individual flows, run files in parallel, and store a per-case index so a case can be re-checked without rescanning the capture. Until then, use `--limit`, `--case-id` and a small capture for testing.
+
+### Limitations
+
+* The dashboard does not show PCAP evidence, anomaly findings or case priorities yet (the data exists in the database, or in the output files for prioritization).
+* The Overview page still has placeholder ("Pending") sections and re-runs detection every time it loads. On a full dataset the Overview and Timeline pages take too long to display (see [Dashboard performance](#dashboard-performance)).
+* The case priority shown on the Cases page is still "Pending"; the scores from `prioritization.py` are not used by the dashboard.
+* PCAP evidence is slow on large captures and many cases (see [PCAP evidence performance](#pcap-evidence-performance)).
+* The `pipeline` service does not run anomaly detection unless `--with-anomaly` is passed.
+* `Dashboard/project_paths.py` uses `MITS_DB_PATH` when it is set (Docker sets it to `/data/mits.db`). Without it the default is still `Dashboard/database/mits.db`, while the rest of the project uses `database/mits.db` in the repository root. Always pass `--db` to the scripts when running locally.
+* **One process at a time on the database.** All parts share one SQLite file, so running two tools against `mits.db` at the same time (for example two pipeline runs, or ingest while another container or program has the database open) fails with `database is locked`. Containers started with `docker compose run` are not stopped by `docker compose down`; check `docker ps` and stop them with `docker stop <name>`.
+* Suricata timestamps keep their own timezone offset and are not normalised to UTC at ingestion. Code that reads `events.ts` must parse the offset instead of assuming UTC.
+* PCAP evidence matches cases to packets by IP address, port and a padded time window (±2 seconds by default).
+* Anomaly detection is based on traffic volume per 60-second window, only reports spikes (not drops) and has no time-of-day model; its findings are statistical outliers that need triage, not confirmed attacks.
 
 ## Help
 
-* **`failed to connect to the docker API` / `cannot find the file specified`** – Docker Desktop is not running. Start it and wait until it reports that the engine is running.
+* **`failed to connect to the docker API` / `cannot find the file specified` / `500 Internal Server Error ... dockerDesktopLinuxEngine`** – Docker Desktop is not running or its backend is stuck. Start it and wait until it reports that the engine is running. If that does not help, run `wsl --shutdown` and start Docker Desktop again.
 * **Port 8501 is already in use** – another Streamlit instance is running. Stop it, or change the left-hand port in `docker-compose.yml` (e.g. `"8502:8501"`) and open http://localhost:8502.
-* **`ModuleNotFoundError` inside a container** – a package is imported in the code but missing from that part's `requirements.txt`. Add it (with a pinned version) and rebuild.
-* **Code changes do not show up** – the image still contains the old code. Rebuild with `docker compose up --build`.
+* **`sqlite3.OperationalError: unable to open database file` in the dashboard (Docker)** – the dashboard container cannot find the database. Make sure `database/mits.db` exists (run ingestion and the pipeline first) and that `Dashboard/project_paths.py` reads `MITS_DB_PATH`; the dashboard container gets its database from `/data/mits.db`, not from a path inside the image.
+* **`unable to open database file` when running `ingest` in Docker** – on some Windows setups the ingest container cannot create a brand-new `mits.db` in the mounted `database/` folder. Create an empty file first (`New-Item -ItemType File -Force database\mits.db`) and run ingest again, or ingest locally: `python -u -m Dashboard.analysis.pipeline input\eve.json --db database\mits.db`.
+* **`database is locked`** – another process still has `mits.db` open: a pipeline or dashboard container, a local Python run, or a database viewer. Run `docker ps`, stop leftover containers with `docker stop <name>` (`docker compose down` does not stop containers started with `docker compose run`), close other programs that use the file, and try again. Run the tools one at a time.
+* **The Overview or Timeline page keeps loading** – with a full dataset these pages load every event and (Overview) re-run detection each time they open; this is a known limitation, see [Dashboard performance](#dashboard-performance). Wait for the page to finish, or use a database built from a small sample file.
+* **`ModuleNotFoundError` inside a container** – either a package is imported in the code but missing from that part's `requirements.txt` (add it with a pinned version and rebuild), or a file that is imported is not in the image. For the `pipeline` image check both the `COPY` lines in `Pipeline/Dockerfile` and the allowlist in the root `.dockerignore`.
+* **`ModuleNotFoundError` when running locally (for example `orjson`)** – the virtual environment is not active or the requirements are not installed. Activate `.venv` and run the `pip install -r ...` commands again. Packages installed in Docker are not available locally.
+* **Code changes do not show up** – in Docker the image still contains the old code; rebuild with `docker compose up --build` (dashboard) or `docker compose --profile tools build pipeline` (pipeline). Locally, check that you edited the file under `Dashboard/analysis/`.
+* **The terminal stays blank for minutes** – output buffering. Run Python with `-u`. If `python.exe` uses CPU in Task Manager, the program is working.
 * **`input file not found: /input/...`** – the file is not in the `input/` folder, or the path after `ingest` does not start with `/input/`.
+* **PCAP evidence reports `WinError 206` (filename too long)** – long filters are split into batches automatically in the current `pcap_evidence.py`; make sure you are running the current version.
 * **Database location in code** – inside Docker the database is at `/data/mits.db`, and the dashboard receives this path in the `MITS_DB_PATH` environment variable. Code that opens the database should read that variable instead of using a fixed path.
 
 Show the options of each command-line tool:
@@ -141,12 +330,33 @@ docker compose run --rm pipeline --help
 docker compose run --rm pcap-evidence --help
 ```
 
+### Development notes
+
+* **All analysis code lives in `Dashboard/analysis/`.** There is no other copy. A second `analysis/` folder at the top level used to exist and caused edits to be made in a copy that Python never imported; if a duplicate appears again, delete it instead of editing it.
+* **The same files run in two differently built containers.** `dashboard` is built with `./Dashboard` as the build context, so inside that container `Dashboard/` is the root and imports look like `from analysis.detection import ...` and `from project_paths import DATABASE_FILE`. `pipeline` is built from the repository root, so the full path is kept and imports look like `from Dashboard.analysis.detection import ...`. One fixed import style cannot work in both, so modules shared by both use a fallback:
+  ```python
+  try:
+      from Dashboard.project_paths import DATABASE_FILE
+  except ImportError:
+      from project_paths import DATABASE_FILE
+  ```
+* **Do not convert timestamps with `.astype("int64") // 1_000_000_000`.** Depending on the pandas version, timestamps can be stored with microsecond instead of nanosecond resolution, which silently makes time windows 1000 times too large. Use `(ts - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)` or cast to `datetime64[ns]` explicitly first.
+* **Editing files with PowerShell `-replace`:** `` `r`n `` only becomes a line break inside double quotes; in single quotes it is written literally and breaks Python syntax. Use a here-string (`@"..."@`) or a text editor.
+* **Testing tip:** keep a small sample `eve.json` and a separate database (for example `--db database\mits_small.db`). A full run on it takes seconds and checks the whole chain before the full dataset is processed.
+
 ## Authors
 
-[//]: # (Contributors names and contact info)
-[//]: # (eg. Jehan Master + gituser link i think ┌ [ಠ_ಠ]┘)
+* [Jehan Master](https://github.com/Jehan-Master)
+* [Jessica Camacho](https://github.com/JessicaC)
+* [Jakub Mazur](https://github.com/sigma-Jakub)
+* [Oleh Haliuk](https://github.com/OlehHaliuk)
+* [Tristan Janssen](https://github.com/TristanJanssen01)
 
 ## Version History
+
+* **Prototype 3** – 30/10/2026
+* **Prototype 2** – 09/10/2026
+* **Prototype 1** – 25/09/2026
 
 ## License
 
