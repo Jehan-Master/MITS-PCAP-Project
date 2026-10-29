@@ -2,7 +2,10 @@ import json
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
-from project_paths import DATABASE_FILE
+try:
+    from Dashboard.project_paths import DATABASE_FILE
+except ImportError:
+    from project_paths import DATABASE_FILE
 
 INACTIVITY_GAP_MINUTES = 5
 LARGEST_SESSION_LIMIT = 10
@@ -318,3 +321,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

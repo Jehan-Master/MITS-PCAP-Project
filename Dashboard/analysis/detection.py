@@ -6,8 +6,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import ipaddress
-from project_paths import DATABASE_FILE
-
+try:
+    from Dashboard.project_paths import DATABASE_FILE
+except ImportError:
+    from project_paths import DATABASE_FILE
 # Casting a tz-aware column to datetime64[ns] (done throughout this file,
 # deliberately, to get consistent naive/UTC-equivalent timestamps across
 # every rule -- see the comments near each .astype("datetime64[ns]") call)
@@ -1537,3 +1539,4 @@ if __name__ == "__main__":
                 f"Anomaly types: "
                 f"{details['anomaly_types']}"
             )
+

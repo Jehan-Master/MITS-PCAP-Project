@@ -27,7 +27,7 @@ from Dashboard.analysis.detection import (
     load_events_light,
 )
 from Dashboard.analysis.ingest import ingest_file, open_database, print_summary
-
+from AnomalyDetection.anomaly_detection import run_analysis as run_anomaly_analysis
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DATABASE_FILE = REPOSITORY_ROOT / "database" / "mits.db"

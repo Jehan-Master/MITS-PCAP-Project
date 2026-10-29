@@ -19,27 +19,50 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 
-from analysis.case_correlation import (
-    build_candidate_cases,
-    get_destinations,
-    get_finding_id,
-    get_flow_ids,
-    get_ports,
-)
-from analysis.correlation import (
-    DATABASE_FILE,
-    build_sessions,
-    create_sessions,
-    group_flows,
-    load_flows,
-)
-from analysis.detection import (
-    build_high_connection_findings,
-    build_multi_port_findings,
-    build_protocol_anomaly_findings,
-    detect_repeated_failed_authentication,
-    load_events,
-)
+try:
+    from Dashboard.analysis.case_correlation import (
+        build_candidate_cases,
+        get_destinations,
+        get_finding_id,
+        get_flow_ids,
+        get_ports,
+    )
+    from Dashboard.analysis.correlation import (
+        build_sessions,
+        create_sessions,
+        group_flows,
+        load_flows,
+    )
+    from Dashboard.analysis.detection import (
+        build_high_connection_findings,
+        build_multi_port_findings,
+        build_protocol_anomaly_findings,
+        detect_repeated_failed_authentication,
+        load_events,
+    )
+except ImportError:
+    from analysis.case_correlation import (
+        build_candidate_cases,
+        get_destinations,
+        get_finding_id,
+        get_flow_ids,
+        get_ports,
+    )
+    from analysis.correlation import (
+        build_sessions,
+        create_sessions,
+        group_flows,
+        load_flows,
+    )
+    from analysis.detection import (
+        build_high_connection_findings,
+        build_multi_port_findings,
+        build_protocol_anomaly_findings,
+        detect_repeated_failed_authentication,
+        load_events,
+    )
+
+DATABASE_FILE = Path(__file__).resolve().parent.parent.parent / "database" / "mits.db"
 
 
 MODEL_RANDOM_STATE = 42
@@ -79,7 +102,7 @@ def priority_level_from_score(score):
 
 
 def create_findings():
-    events = load_events()
+    events = load_events(database_path=DATABASE_FILE)
     findings = []
 
     # Extend the same result list instead of repeatedly copying findings.

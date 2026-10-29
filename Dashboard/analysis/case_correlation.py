@@ -2,7 +2,7 @@ from itertools import combinations
 
 import pandas as pd
 
-from analysis.detection import (
+from Dashboard.analysis.detection import (
     build_high_connection_findings,
     build_multi_port_findings,
     detect_repeated_failed_authentication,

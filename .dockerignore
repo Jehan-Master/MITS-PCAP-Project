@@ -1,4 +1,6 @@
 *
 !Pipeline/requirements.txt
 !Dashboard/analysis/
+!Dashboard/project_paths.py
+!AnomalyDetection/
 **/__pycache__

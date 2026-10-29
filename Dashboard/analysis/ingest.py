@@ -1,4 +1,7 @@
-from project_paths import DATABASE_FILE
+try:
+    from Dashboard.project_paths import DATABASE_FILE
+except ImportError:
+    from project_paths import DATABASE_FILE
 import argparse
 import base64
 import hashlib
@@ -251,3 +254,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
